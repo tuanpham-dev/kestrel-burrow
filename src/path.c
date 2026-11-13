@@ -291,6 +291,68 @@ static int has_parent(const char* rest) {
     return 0;
 }
 
+/* -- Directory cache (Kestrel) ------------------------------------------------------------
+ * The walk checks every component with lstat(). Each process remembers the resolved guest
+ * directories it has already seen to be real directories (no symlink, no binding), and skips
+ * their lstat() while a counter shared by all guest processes is unchanged. Anything that can
+ * turn a directory into something else bumps the counter: renaming a directory or symlink,
+ * removing a directory, mount, umount, chroot. Changes made from outside the guest (another app,
+ * Android's Files) are not seen; they are rare for directories. */
+#define DIRCACHE_SLOTS 4096
+struct dirslot { uint64_t key, meta, check; }; /* meta: generation << 16 | length */
+static struct dirslot dircache[DIRCACHE_SLOTS];
+static uint64_t* volatile pathgen; /* shared counter; 0 until mapped, (uint64_t*) 1 if unavailable */
+
+static uint64_t* gen_counter(void) {
+    uint64_t* g = pathgen;
+    if (g == (uint64_t*) 1) return 0;
+    if (g) return g;
+    char p[PATH_MAX];
+    long n = copy(p, PATH_MAX - 32, cfg.root);
+    if (n < 0) { pathgen = (uint64_t*) 1; return 0; }
+    memcpy(p + n, "/.kestrel-pathgen", 18);
+    long fd = sys(NR_openat, AT_FDCWD, (long) p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) { pathgen = (uint64_t*) 1; return 0; }
+    sys(46 /* NR_ftruncate */, fd, 4096, 0, 0);
+    long m = sys6(NR_mmap, 0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    sys(NR_close, fd, 0, 0, 0);
+    if (m < 0 && m > -4096) { pathgen = (uint64_t*) 1; return 0; }
+    pathgen = (uint64_t*) m;
+    return pathgen;
+}
+
+void pathcache_invalidate(void) {
+    uint64_t* g = gen_counter();
+    if (g) __atomic_add_fetch(g, 1, __ATOMIC_RELEASE);
+}
+
+static uint64_t fnv(const char* s, long n) {
+    uint64_t h = 1469598103934665603ull;
+    for (long i = 0; i < n; i++) h = (h ^ (unsigned char) s[i]) * 1099511628211ull;
+    return h;
+}
+
+static int dircache_has(const char* p, long n) {
+    uint64_t* g = gen_counter();
+    if (!g) return 0;
+    uint64_t key = fnv(p, n), gen = __atomic_load_n(g, __ATOMIC_ACQUIRE);
+    struct dirslot* s = &dircache[key % DIRCACHE_SLOTS];
+    uint64_t k = __atomic_load_n(&s->key, __ATOMIC_RELAXED), m = __atomic_load_n(&s->meta, __ATOMIC_RELAXED),
+             c = __atomic_load_n(&s->check, __ATOMIC_RELAXED);
+    return k == key && c == (k ^ m ^ 0x9e3779b97f4a7c15ull) && m == (gen << 16 | (uint64_t) (n & 0xffff));
+}
+
+static void dircache_put(const char* p, long n) {
+    uint64_t* g = gen_counter();
+    if (!g) return;
+    uint64_t key = fnv(p, n), meta = __atomic_load_n(g, __ATOMIC_ACQUIRE) << 16 | (uint64_t) (n & 0xffff);
+    struct dirslot* s = &dircache[key % DIRCACHE_SLOTS];
+    __atomic_store_n(&s->check, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->key, key, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->meta, meta, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->check, key ^ meta ^ 0x9e3779b97f4a7c15ull, __ATOMIC_RELEASE);
+}
+
 /* The slow path: resolves @path one component at a time. */
 static long walk(const char* path, int follow, char* host, char* out) {
     char rest[PATH_MAX], target[PATH_MAX];
@@ -335,6 +397,7 @@ static long walk(const char* path, int follow, char* host, char* out) {
             return join(out, out, n, rest + at) < 0 ? -ENAMETOOLONG : 0;
         }
         if (last && !follow) break;
+        if (!last && b == 0 && dircache_has(out, n)) continue; /* a directory seen before */
 
         struct kstat st;
         long r = host_of(out, n, host);
@@ -375,6 +438,7 @@ static long walk(const char* path, int follow, char* host, char* out) {
             continue;
         }
         if (!last && (st.mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
+        if (!last && b == 0) dircache_put(out, n);
         if (last) break;
     }
     long h = host_of(out, n, host);

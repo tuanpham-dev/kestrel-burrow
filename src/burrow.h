@@ -45,7 +45,7 @@ enum {
     NR_setxattr = 5, NR_lsetxattr = 6, NR_fsetxattr = 7, NR_getxattr = 8, NR_fgetxattr = 10, NR_lgetxattr = 9, NR_listxattr = 11, NR_llistxattr = 12,
     NR_removexattr = 14, NR_lremovexattr = 15, NR_getcwd = 17, NR_fcntl = 25, NR_ioctl = 29, NR_inotify_add_watch = 27,
     NR_mknodat = 33, NR_mkdirat = 34, NR_unlinkat = 35, NR_symlinkat = 36, NR_linkat = 37, NR_renameat = 38,
-    NR_statfs = 43, NR_fstatfs = 44, NR_truncate = 45, NR_faccessat = 48, NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54,
+    NR_statfs = 43, NR_fstatfs = 44, NR_fchmod = 52, NR_truncate = 45, NR_faccessat = 48, NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54,
     NR_fchown = 55, NR_openat = 56, NR_close = 57, NR_getdents64 = 61, NR_lseek = 62, NR_read = 63, NR_write = 64, NR_pread64 = 67,
     NR_readlinkat = 78, NR_newfstatat = 79, NR_fstat = 80, NR_utimensat = 88, NR_exit_group = 94,
     NR_tgkill = 131, NR_sigaltstack = 132, NR_rt_sigaction = 134, NR_rt_sigprocmask = 135, NR_rt_sigreturn = 139,NR_setregid = 143, NR_setgid = 144,
@@ -95,6 +95,8 @@ enum {
 #define AF_INET 2
 #define PROT_READ 1
 #define PROT_WRITE 2
+#define MAP_SHARED 0x01
+#define O_RDWR 02
 #define PROT_EXEC 4
 #define MAP_PRIVATE 0x02
 #define MAP_FIXED 0x10
@@ -272,6 +274,8 @@ int guest_sees(const char* host);
  * is then the file, opened O_PATH (to be closed), else -1 and @host is to be
  * used. ENOENT is final: no directory is checked for a file to create. */
 long host_fd(long dirfd, const char* path, int follow, char* host, long* fd);
+/* Path cache (Kestrel): forget every cached directory, in every guest process. */
+void pathcache_invalidate(void);
 /* openat() in one walk, when the kernel resolves the path as we would: a
  * plain path and no symlink. -ELOOP, -EINVAL (openat2() is stricter) and
  * -EACCES (the fake root's permissions) mean taking to_host()'s way. */

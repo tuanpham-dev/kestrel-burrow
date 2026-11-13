@@ -20,7 +20,7 @@ extern char burrow_gadget[], burrow_sigreturn[];
 static const uint16_t trapped[] = {
     NR_setxattr, NR_lsetxattr, NR_getxattr, NR_lgetxattr, NR_listxattr, NR_llistxattr, NR_removexattr,
     NR_lremovexattr, NR_getcwd, NR_inotify_add_watch, NR_mknodat, NR_mkdirat, NR_unlinkat, NR_symlinkat,
-    NR_linkat, NR_renameat, NR_statfs, NR_fstatfs, NR_truncate, NR_faccessat, NR_chdir, NR_fchmodat, NR_fchownat, NR_fchown,
+    NR_linkat, NR_renameat, NR_statfs, NR_fstatfs, NR_truncate, NR_faccessat, NR_chdir, NR_fchmodat, NR_fchownat, NR_fchown, NR_fchmod,
     NR_openat, NR_readlinkat, NR_getdents64, NR_newfstatat, NR_fstat, NR_utimensat, NR_rt_sigaction, NR_rt_sigprocmask,
     NR_rt_sigreturn,
     NR_setregid, NR_setgid, NR_setreuid, NR_setuid, NR_setresuid, NR_getresuid, NR_setresgid, NR_getresgid,
@@ -320,7 +320,8 @@ static int on_shared_storage(uint32_t major, uint32_t minor) {
  * attributes, so their owner is not stored. */
 #define OWN_XATTR "user.kestrel.own"
 #define OWN_MAGIC 0x4b4f574eu /* "KOWN" */
-struct own { uint32_t magic, uid, gid, mode; }; /* mode: permission bits 07777 */
+struct own { uint32_t magic, uid, gid, mode; }; /* mode: permission bits 07777, OWN_MODE_SET if chmod() set them */
+#define OWN_MODE_SET 0x80000000u
 
 static int own_get_path(const char* host, int follow, struct own* o) {
     long r = sys6(follow ? NR_getxattr : NR_lgetxattr, (long) host, (long) OWN_XATTR, (long) o, sizeof *o, 0, 0);
@@ -338,12 +339,21 @@ static int own_get_fd(long fd, struct own* o) {
 }
 
 static long own_set_path(const char* host, int follow, const struct own* o) {
-    return sys6(follow ? NR_setxattr : NR_lsetxattr, (long) host, (long) OWN_XATTR, (long) o, sizeof *o, 0, 0);
+    long r = sys6(follow ? NR_setxattr : NR_lsetxattr, (long) host, (long) OWN_XATTR, (long) o, sizeof *o, 0, 0);
+    if (r != -EACCES) return r;
+    /* User attributes need write permission: a read-only file of the app's (dpkg unpacks some
+     * 0444 before its chown) gets owner-write for the moment. */
+    struct kstat st;
+    if (sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, 0) < 0 || st.uid != cfg.real_uid) return r;
+    if (sys(NR_fchmodat, AT_FDCWD, (long) host, (st.mode & 07777) | 0200, 0) < 0) return r;
+    r = sys6(NR_setxattr, (long) host, (long) OWN_XATTR, (long) o, sizeof *o, 0, 0);
+    sys(NR_fchmodat, AT_FDCWD, (long) host, st.mode & 07777, 0);
+    return r;
 }
 
 static long own_set_fd(long fd, const struct own* o) {
     long r = sys6(NR_fsetxattr, fd, (long) OWN_XATTR, (long) o, sizeof *o, 0, 0);
-    if (r == -EBADF) {
+    if (r == -EBADF || r == -EACCES) {
         char p[32] = "/proc/self/fd/";
         format_unsigned(p + 14, (unsigned long) fd);
         return own_set_path(p, 1, o);
@@ -355,7 +365,7 @@ static void fake_stat_own(long r, struct kstat* st, const struct own* o) {
     if (r != 0) return;
     if (o) {
         st->uid = o->uid, st->gid = o->gid;
-        st->mode = (st->mode & ~07777u) | (o->mode & 07777u);
+        if (o->mode & OWN_MODE_SET) st->mode = (st->mode & ~07777u) | (o->mode & 07777u);
         return;
     }
     if (on_shared_storage((st->dev >> 8) & 0xfff, (st->dev & 0xff) | ((st->dev >> 12) & 0xfff00)))
@@ -370,7 +380,7 @@ static void fake_statx_own(long r, struct kstatx* stx, const struct own* o) {
     if (o) {
         if (stx->mask & STATX_UID) stx->uid = o->uid;
         if (stx->mask & STATX_GID) stx->gid = o->gid;
-        if (stx->mask & STATX_MODE) stx->mode = (uint16_t) ((stx->mode & ~07777u) | (o->mode & 07777u));
+        if ((stx->mask & STATX_MODE) && (o->mode & OWN_MODE_SET)) stx->mode = (uint16_t) ((stx->mode & ~07777u) | (o->mode & 07777u));
         return;
     }
     uint32_t uid = (stx->mask & STATX_UID) ? stx->uid : ~0u;
@@ -499,7 +509,7 @@ static long do_getcwd(char* buf, long size) {
 static void own_current(const struct kstat* st, struct own* o) {
     uint32_t uid = st->uid, gid = st->gid;
     fake_owner(&uid, &gid, st->mode);
-    o->magic = OWN_MAGIC, o->uid = uid, o->gid = gid, o->mode = st->mode & 07777u;
+    o->magic = OWN_MAGIC, o->uid = uid, o->gid = gid, o->mode = 0; /* permissions: the host's */
 }
 
 /* chown(): records the new owner in the store; only the guest's root may give a file away. */
@@ -519,7 +529,7 @@ static long do_chown(long dirfd, const char* path, long uid, long gid, long flag
         if (own_get_fd(dirfd, &o)) own_current(&st, &o);
         if ((r = own_chown(&o, (uint32_t) uid, (uint32_t) gid)) < 0) return r;
         r = own_set_fd(dirfd, &o);
-        return r == -EOPNOTSUPP || r == -EPERM ? 0 : r;
+        return r == -EOPNOTSUPP || r == -EPERM || r == -EACCES ? 0 : r;
     }
     char host[PATH_MAX];
     int follow = !(flags & AT_SYMLINK_NOFOLLOW);
@@ -529,11 +539,17 @@ static long do_chown(long dirfd, const char* path, long uid, long gid, long flag
     if (own_get_path(host, 1, &o)) own_current(&st, &o);
     if ((r = own_chown(&o, (uint32_t) uid, (uint32_t) gid)) < 0) return r;
     r = own_set_path(host, 1, &o);
-    return r == -EOPNOTSUPP || r == -EPERM ? 0 : r;
+    return r == -EOPNOTSUPP || r == -EPERM || r == -EACCES ? 0 : r;
 }
 
-/* chmod(): the host gets the bits it accepts; the store keeps the full set (set-user-ID
- * bits included) for stat() to show. */
+/* chmod(): the host gets the bits; the store keeps them only when the host did not (set-id bits
+ * it refused), so most files never get a store record for their mode. */
+static void own_mode_after(const struct kstat* st, long mode, struct own* o, int have) {
+    if (!have) own_current(st, o);
+    if ((st->mode & 07777u) != ((uint32_t) mode & 07777u)) o->mode = ((uint32_t) mode & 07777u) | OWN_MODE_SET;
+    else o->mode = 0;
+}
+
 static long do_chmod(long dirfd, const char* path, long mode, long flags) {
     struct kstat st;
     struct own o;
@@ -541,12 +557,15 @@ static long do_chmod(long dirfd, const char* path, long mode, long flags) {
     long r;
     int follow = !(flags & AT_SYMLINK_NOFOLLOW);
     if (empty(path) && (flags & AT_EMPTY_PATH)) {
-        r = sys(NR_fchmodat2, dirfd, (long) path, mode, flags);
-        if (r < 0 && r != -EPERM) return r;
+        r = sys(NR_fchmod, dirfd, mode & 07777, 0, 0);
+        if (r == -EPERM) r = sys(NR_fchmod, dirfd, mode & 0777, 0, 0);
+        if (r < 0) return r;
         if (sys(NR_fstat, dirfd, &st, 0, 0) == 0) {
-            if (own_get_fd(dirfd, &o)) own_current(&st, &o);
-            o.mode = (uint32_t) mode & 07777u;
-            own_set_fd(dirfd, &o);
+            int have = own_get_fd(dirfd, &o) == 0;
+            if (have || (st.mode & 07777u) != ((uint32_t) mode & 07777u)) {
+                own_mode_after(&st, mode, &o, have);
+                own_set_fd(dirfd, &o);
+            }
         }
         return 0;
     }
@@ -555,9 +574,11 @@ static long do_chmod(long dirfd, const char* path, long mode, long flags) {
     if (r == -EPERM) r = sys(NR_fchmodat, AT_FDCWD, (long) host, mode & 0777, 0); /* host refused set-id bits */
     if (r < 0) return r;
     if (sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, 0) == 0 && (st.mode & S_IFMT) != S_IFLNK) {
-        if (own_get_path(host, 1, &o)) own_current(&st, &o);
-        o.mode = (uint32_t) mode & 07777u;
-        own_set_path(host, 1, &o);
+        int have = own_get_path(host, 1, &o) == 0;
+        if (have || (st.mode & 07777u) != ((uint32_t) mode & 07777u)) {
+            own_mode_after(&st, mode, &o, have);
+            own_set_path(host, 1, &o); /* handles a file the chmod just made read-only */
+        }
     }
     return 0;
 }
@@ -964,7 +985,10 @@ long emulate_execve(long dirfd, const char* path, char* const* argv, char* const
         if (depth == 0) {
             struct own o;
             set_ids_mode = st.mode & (S_ISUID | S_ISGID);
-            if (own_get_path(host, 1, &o) == 0) set_ids_mode = o.mode & (S_ISUID | S_ISGID), set_uid_to = o.uid, set_gid_to = o.gid;
+            if (own_get_path(host, 1, &o) == 0) {
+                if (o.mode & OWN_MODE_SET) set_ids_mode = o.mode & (S_ISUID | S_ISGID);
+                set_uid_to = o.uid, set_gid_to = o.gid;
+            }
         }
         r = sys(NR_faccessat, AT_FDCWD, host, X_OK, 0);
         if (r < 0) return r;
@@ -1211,6 +1235,7 @@ static long add_binding(const char* guest, long g, const char* host, long h, int
  * takes the mounts: Flatpak binds /dev and /sys whole, and the GPU's render
  * node and sysfs entries are bindings below them. */
 static long do_mount(const char* source, const char* target, long flags) {
+    pathcache_invalidate();
     char host[PATH_MAX], guest[PATH_MAX], from[PATH_MAX], below[PATH_MAX];
     if (!may_mount()) return -EPERM;
     if (!(flags & 4096 /* MS_BIND */) || (flags & 32 /* MS_REMOUNT */)) return 0;
@@ -1244,6 +1269,7 @@ static long do_mount(const char* source, const char* target, long flags) {
 
 /* umount2(): a binding made by mount() goes; anything else pretends. */
 static long do_umount(const char* target) {
+    pathcache_invalidate();
     char guest[PATH_MAX];
     if (!may_mount()) return -EPERM;
     long g = mount_point(target, guest);
@@ -1269,6 +1295,7 @@ static long do_mprotect(const uint64_t* x) {
  * SysV IPC stays in the first root (cfg.ipc), link2symlink's links of the
  * old one are followed by their host paths (path.c). */
 static long do_chroot(const char* path) {
+    pathcache_invalidate();
     char host[PATH_MAX], absolute[PATH_MAX], guest[PATH_MAX], root[sizeof(cfg.root)];
     if (!may_mount()) return -EPERM;
     if (path == 0) return -EFAULT;
@@ -1385,6 +1412,7 @@ static long emulate(long nr, const uint64_t* x) {
         long r = host_path(dirfd, path, 0, host);
         if (r < 0) return r;
         if (!(x[2] & 0x200 /* AT_REMOVEDIR */) && (r = l2s_unlinked(host)) < 0) return r;
+        if (x[2] & 0x200) pathcache_invalidate(); /* a directory goes away */
         r = sys(NR_unlinkat, AT_FDCWD, host, x[2], 0);
         if (r != -EACCES || id(FSUID) != 0) return r;
         /* Root removes from read-only directories too (rm -rf of Go's module cache). */
@@ -1436,8 +1464,15 @@ static long emulate(long nr, const uint64_t* x) {
         if (r < 0) return r;
         /* A faked hard link replaced: one link less. */
         if ((r = l2s_unlinked(to)) < 0) return r;
+        { /* renaming a directory or a symlink changes what paths resolve to */
+            struct kstat st;
+            if (sys(NR_newfstatat, AT_FDCWD, (long) from, (long) &st, AT_SYMLINK_NOFOLLOW) < 0 ||
+                (st.mode & S_IFMT) != S_IFREG)
+                pathcache_invalidate();
+        }
         return sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, nr == NR_renameat ? 0 : (long) x[4], 0);
     }
+    case NR_fchmod: return do_chmod(x[0], "", (long) x[1], AT_EMPTY_PATH);
     case NR_fchmodat: return do_chmod(dirfd, path, (long) x[2], 0);
     case NR_fchmodat2: return do_chmod(dirfd, path, (long) x[2], (long) x[3]);
     case NR_fchownat: return do_chown(dirfd, path, (long) x[2], (long) x[3], (long) x[4]);
