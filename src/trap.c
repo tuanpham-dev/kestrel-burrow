@@ -28,6 +28,7 @@ static const uint16_t trapped[] = {
     NR_execve, NR_renameat2, NR_execveat, NR_statx, NR_openat2, NR_faccessat2, NR_fchmodat2, NR_sendmsg,
     NR_sendto, NR_getsockname, NR_getpeername, NR_shmget, NR_shmctl, NR_shmat, NR_shmdt, NR_chroot,
     NR_semget, NR_semctl, NR_semtimedop, NR_semop, NR_msgget, NR_msgctl, NR_msgrcv, NR_msgsnd,
+    NR_capget, NR_capset,
     NR_clone3, /* ENOSYS, as under Android: CLONE_CLEAR_SIGHAND would drop our handler */
     NR_mount, NR_umount2, NR_unshare,
     /* ENOSYS: the new mount API takes paths we would not translate (libglnx,
@@ -1532,6 +1533,29 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_execveat:
         return emulate_execve(dirfd, path, (char* const*) x[2], (char* const*) x[3], (long) x[4]);
 
+    case NR_capget: {
+        /* Capabilities (Kestrel): the guest's root shows them all, other users none; daemons that
+         * drop them (dbus-daemon, sshd) see the drop succeed. Nothing reaches the kernel. */
+        uint32_t* header = (uint32_t*) x[0]; /* version, pid */
+        uint32_t* data = (uint32_t*) x[1];   /* 2 x {effective, permitted, inheritable} for v3 */
+        if (header == 0) return -EFAULT;
+        if (header[0] != 0x20080522 /* _LINUX_CAPABILITY_VERSION_3 */ && header[0] != 0x20071026 /* v2 */) {
+            header[0] = 0x20080522;
+            return data ? -EINVAL : 0;
+        }
+        if (data) {
+            uint32_t all = id(EUID) == 0 ? 0xffffffffu : 0;
+            for (int i = 0; i < 2; i++) data[i * 3] = all, data[i * 3 + 1] = all, data[i * 3 + 2] = 0;
+            data[3] &= 0x1ff, data[4] &= 0x1ff; /* capabilities 32..40 */
+        }
+        return 0;
+    }
+    case NR_capset: {
+        uint32_t* header = (uint32_t*) x[0];
+        if (header == 0) return -EFAULT;
+        if (header[0] != 0x20080522 && header[0] != 0x20071026) return -EINVAL;
+        return 0;
+    }
     case NR_getuid: return id(RUID);
     case NR_geteuid: return id(EUID);
     case NR_getgid: return id(RGID);
