@@ -42,7 +42,7 @@
 /* -- Kernel interface (arm64, asm-generic) ------------------------------------ */
 
 enum {
-    NR_setxattr = 5, NR_lsetxattr = 6, NR_getxattr = 8, NR_lgetxattr = 9, NR_listxattr = 11, NR_llistxattr = 12,
+    NR_setxattr = 5, NR_lsetxattr = 6, NR_fsetxattr = 7, NR_getxattr = 8, NR_fgetxattr = 10, NR_lgetxattr = 9, NR_listxattr = 11, NR_llistxattr = 12,
     NR_removexattr = 14, NR_lremovexattr = 15, NR_getcwd = 17, NR_fcntl = 25, NR_ioctl = 29, NR_inotify_add_watch = 27,
     NR_mknodat = 33, NR_mkdirat = 34, NR_unlinkat = 35, NR_symlinkat = 36, NR_linkat = 37, NR_renameat = 38,
     NR_statfs = 43, NR_fstatfs = 44, NR_truncate = 45, NR_faccessat = 48, NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54,
@@ -62,7 +62,7 @@ enum {
 };
 
 enum {
-    EPERM = 1, ENOENT = 2, ESRCH = 3, EINTR = 4, EIO = 5, E2BIG = 7, ENOEXEC = 8, EBADF = 9, ENOMEM = 12, EACCES = 13,
+    EPERM = 1, ENODATA = 61, EOPNOTSUPP = 95, ENOENT = 2, ESRCH = 3, EINTR = 4, EIO = 5, E2BIG = 7, ENOEXEC = 8, EBADF = 9, ENOMEM = 12, EACCES = 13,
     EFAULT = 14, EXDEV = 18, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, EMFILE = 24, ERANGE = 34, ENAMETOOLONG = 36, ENOSYS = 38,
     ELOOP = 40,
 };
