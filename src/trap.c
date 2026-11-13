@@ -20,7 +20,7 @@ extern char burrow_gadget[], burrow_sigreturn[];
 static const uint16_t trapped[] = {
     NR_setxattr, NR_lsetxattr, NR_getxattr, NR_lgetxattr, NR_listxattr, NR_llistxattr, NR_removexattr,
     NR_lremovexattr, NR_getcwd, NR_inotify_add_watch, NR_mknodat, NR_mkdirat, NR_unlinkat, NR_symlinkat,
-    NR_linkat, NR_renameat, NR_statfs, NR_fstatfs, NR_truncate, NR_faccessat, NR_chdir, NR_fchmodat, NR_fchownat, NR_fchown, NR_fchmod,
+    NR_linkat, NR_renameat, NR_statfs, NR_fstatfs, NR_truncate, NR_faccessat, NR_chdir, NR_fchmodat, NR_fchownat, NR_fchown,
     NR_openat, NR_readlinkat, NR_getdents64, NR_newfstatat, NR_fstat, NR_utimensat, NR_rt_sigaction, NR_rt_sigprocmask,
     NR_rt_sigreturn,
     NR_setregid, NR_setgid, NR_setreuid, NR_setuid, NR_setresuid, NR_getresuid, NR_setresgid, NR_getresgid,
@@ -362,11 +362,33 @@ static long own_set_fd(long fd, const struct own* o) {
     return r;
 }
 
+/* The rootfs's device: its files without a store record are root's (files created by other
+ * guest users get a record when created). Files elsewhere (/proc, /dev, shared storage) keep
+ * proot's view: the app's show as the viewer's. */
+static uint64_t root_dev(void) {
+    static uint64_t dev = 0;
+    if (dev == 0) {
+        struct kstat st;
+        dev = sys(NR_newfstatat, AT_FDCWD, (long) cfg.root, (long) &st, 0) == 0 ? st.dev : 1;
+    }
+    return dev;
+}
+
 static void fake_stat_own(long r, struct kstat* st, const struct own* o) {
     if (r != 0) return;
     if (o) {
         st->uid = o->uid, st->gid = o->gid;
-        if (o->mode & OWN_MODE_SET) st->mode = (st->mode & ~07777u) | (o->mode & 07777u);
+        /* the stored mode only while the host's permission bits still match it: fchmod() is not
+         * trapped (trapping it breaks Chromium's sandbox), so it may have changed them since */
+        if ((o->mode & OWN_MODE_SET) && (o->mode & 0777u) == (st->mode & 0777u)) st->mode = (st->mode & ~07777u) | (o->mode & 07777u);
+        return;
+    }
+    /* Regular files and directories can carry a store record, so unrecorded ones are root's.
+     * Sockets, fifos, devices and symlinks cannot (no user xattrs): proot's view, the viewer's. */
+    uint32_t type = st->mode & S_IFMT;
+    if (st->dev == root_dev() && st->uid == cfg.real_uid && (type == S_IFREG || type == S_IFDIR)) {
+        st->uid = 0;
+        if (st->gid == cfg.real_gid) st->gid = 0;
         return;
     }
     if (on_shared_storage((st->dev >> 8) & 0xfff, (st->dev & 0xff) | ((st->dev >> 12) & 0xfff00)))
@@ -378,10 +400,18 @@ static void fake_stat(long r, struct kstat* st) { fake_stat_own(r, st, 0); }
 
 static void fake_statx_own(long r, struct kstatx* stx, const struct own* o) {
     if (r != 0) return;
+    uint64_t dev = ((uint64_t) (stx->dev_minor & 0xff)) | ((uint64_t) stx->dev_major << 8) | ((uint64_t) (stx->dev_minor & ~0xffu) << 12);
+    uint32_t type = stx->mode & S_IFMT;
+    if (!o && dev == root_dev() && (stx->mask & STATX_UID) && stx->uid == cfg.real_uid && (type == S_IFREG || type == S_IFDIR)) {
+        stx->uid = 0;
+        if ((stx->mask & STATX_GID) && stx->gid == cfg.real_gid) stx->gid = 0;
+        return;
+    }
     if (o) {
         if (stx->mask & STATX_UID) stx->uid = o->uid;
         if (stx->mask & STATX_GID) stx->gid = o->gid;
-        if ((stx->mask & STATX_MODE) && (o->mode & OWN_MODE_SET)) stx->mode = (uint16_t) ((stx->mode & ~07777u) | (o->mode & 07777u));
+        if ((stx->mask & STATX_MODE) && (o->mode & OWN_MODE_SET) && (o->mode & 0777u) == (stx->mode & 0777u))
+            stx->mode = (uint16_t) ((stx->mode & ~07777u) | (o->mode & 07777u));
         return;
     }
     uint32_t uid = (stx->mask & STATX_UID) ? stx->uid : ~0u;
@@ -508,14 +538,16 @@ static long do_getcwd(char* buf, long size) {
 /* fchownat(): a fake root's chown succeeds on any file it can see. */
 /* The owner record a file shows now: its stored one, else proot's fake view of the host's. */
 static void own_current(const struct kstat* st, struct own* o) {
-    uint32_t uid = st->uid, gid = st->gid;
-    fake_owner(&uid, &gid, st->mode);
+    struct kstat v = *st;
+    fake_stat_own(0, &v, 0);
+    uint32_t uid = v.uid, gid = v.gid;
     o->magic = OWN_MAGIC, o->uid = uid, o->gid = gid, o->mode = 0; /* permissions: the host's */
 }
 
 /* chown(): records the new owner in the store; only the guest's root may give a file away. */
 static long own_chown(struct own* o, uint32_t uid, uint32_t gid) {
-    if (id(EUID) != 0 && uid != (uint32_t) -1 && uid != o->uid) return -EPERM;
+    /* As Linux: only root gives a file away; the owner may change its group. */
+    if (id(FSUID) != 0 && ((uid != (uint32_t) -1 && uid != o->uid) || id(FSUID) != o->uid)) return -EPERM;
     if (uid != (uint32_t) -1) o->uid = uid;
     if (gid != (uint32_t) -1) o->gid = gid;
     return 0;
@@ -536,7 +568,13 @@ static long do_chown(long dirfd, const char* path, long uid, long gid, long flag
     int follow = !(flags & AT_SYMLINK_NOFOLLOW);
     if ((r = host_path(dirfd, path, follow, host)) < 0) return r;
     if ((r = sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, follow ? 0 : AT_SYMLINK_NOFOLLOW)) < 0) return r;
-    if ((st.mode & S_IFMT) == S_IFLNK) return 0; /* no user attributes on symlinks */
+    if ((st.mode & S_IFMT) == S_IFLNK) {
+        /* a faked hard link (link2symlink): its owner is its file's */
+        char file[PATH_MAX];
+        if (!l2s_file(host, file)) return 0; /* a real symlink: no user attributes on symlinks */
+        if ((r = copy(host, PATH_MAX, file)) < 0) return r;
+        if ((r = sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, 0)) < 0) return r;
+    }
     if (own_get_path(host, 1, &o)) own_current(&st, &o);
     if ((r = own_chown(&o, (uint32_t) uid, (uint32_t) gid)) < 0) return r;
     r = own_set_path(host, 1, &o);
@@ -551,6 +589,9 @@ static void own_mode_after(const struct kstat* st, long mode, struct own* o, int
     else o->mode = 0;
 }
 
+/* Only the file's owner or root may change its mode (as Linux). */
+static int may_chmod(const struct own* o) { return id(FSUID) == 0 || id(FSUID) == o->uid; }
+
 static long do_chmod(long dirfd, const char* path, long mode, long flags) {
     struct kstat st;
     struct own o;
@@ -558,30 +599,62 @@ static long do_chmod(long dirfd, const char* path, long mode, long flags) {
     long r;
     int follow = !(flags & AT_SYMLINK_NOFOLLOW);
     if (empty(path) && (flags & AT_EMPTY_PATH)) {
+        if ((r = sys(NR_fstat, dirfd, &st, 0, 0)) < 0) return r;
+        int have = own_get_fd(dirfd, &o) == 0;
+        if (!have) own_current(&st, &o);
+        if (!may_chmod(&o)) return -EPERM;
         r = sys(NR_fchmod, dirfd, mode & 07777, 0, 0);
         if (r == -EPERM) r = sys(NR_fchmod, dirfd, mode & 0777, 0, 0);
+        if (r == -EBADF) { /* an O_PATH descriptor: through /proc/self/fd */
+            char p[32] = "/proc/self/fd/";
+            format_unsigned(p + 14, (unsigned long) dirfd);
+            r = sys(NR_fchmodat, AT_FDCWD, (long) p, mode & 07777, 0);
+            if (r == -EPERM) r = sys(NR_fchmodat, AT_FDCWD, (long) p, mode & 0777, 0);
+        }
         if (r < 0) return r;
-        if (sys(NR_fstat, dirfd, &st, 0, 0) == 0) {
-            int have = own_get_fd(dirfd, &o) == 0;
-            if (have || (st.mode & 07777u) != ((uint32_t) mode & 07777u)) {
-                own_mode_after(&st, mode, &o, have);
-                own_set_fd(dirfd, &o);
-            }
+        if (sys(NR_fstat, dirfd, &st, 0, 0) == 0 && (have || (st.mode & 07777u) != ((uint32_t) mode & 07777u))) {
+            own_mode_after(&st, mode, &o, 1);
+            own_set_fd(dirfd, &o);
         }
         return 0;
     }
     if ((r = host_path(dirfd, path, follow, host)) < 0) return r;
+    if ((r = sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, AT_SYMLINK_NOFOLLOW)) < 0) return r;
+    if ((st.mode & S_IFMT) == S_IFLNK) {
+        /* not followed (AT_SYMLINK_NOFOLLOW): a faked hard link is its file; a symlink's mode
+         * cannot change (Linux: EOPNOTSUPP) */
+        char file[PATH_MAX];
+        if (!l2s_file(host, file)) return -EOPNOTSUPP;
+        if ((r = copy(host, PATH_MAX, file)) < 0) return r;
+        if ((r = sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, 0)) < 0) return r;
+    }
+    int have = own_get_path(host, 1, &o) == 0;
+    if (!have) own_current(&st, &o);
+    if (!may_chmod(&o)) return -EPERM;
     r = sys(NR_fchmodat, AT_FDCWD, (long) host, mode & 07777, 0);
     if (r == -EPERM) r = sys(NR_fchmodat, AT_FDCWD, (long) host, mode & 0777, 0); /* host refused set-id bits */
     if (r < 0) return r;
-    if (sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, 0) == 0 && (st.mode & S_IFMT) != S_IFLNK) {
-        int have = own_get_path(host, 1, &o) == 0;
-        if (have || (st.mode & 07777u) != ((uint32_t) mode & 07777u)) {
-            own_mode_after(&st, mode, &o, have);
-            own_set_path(host, 1, &o); /* handles a file the chmod just made read-only */
-        }
+    if (sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, 0) == 0 && (have || (st.mode & 07777u) != ((uint32_t) mode & 07777u))) {
+        own_mode_after(&st, mode, &o, 1);
+        own_set_path(host, 1, &o); /* handles a file the chmod just made read-only */
     }
     return 0;
+}
+
+/* Files created by a guest user other than root get a store record naming the creator
+ * (unrecorded files are root's). */
+static void own_stamp_path(const char* host) {
+    if (id(FSUID) == 0) return;
+    struct own o = {OWN_MAGIC, id(FSUID), id(FSGID), 0};
+    own_set_path(host, 1, &o);
+}
+
+static long own_stamp_fd(long fd) {
+    if (fd >= 0 && id(FSUID) != 0) {
+        struct own o = {OWN_MAGIC, id(FSUID), id(FSGID), 0};
+        own_set_fd(fd, &o);
+    }
+    return fd;
 }
 
 /* newfstatat() of @path into @st, the last component followed if @follow;
@@ -602,6 +675,8 @@ static long do_stat(long dirfd, const char* path, struct kstat* st, long flags) 
     long r;
     if (empty(path) && (flags & AT_EMPTY_PATH)) {
         r = sys(NR_newfstatat, dirfd, path, st, flags);
+        struct own o;
+        if (r == 0 && (st->mode & S_IFMT) != S_IFLNK && own_get_fd(dirfd, &o) == 0) { fake_stat_own(r, st, &o); return r; }
     } else {
         char host[PATH_MAX];
         r = stat_host(dirfd, path, 0, host, st);
@@ -637,6 +712,8 @@ static long do_statx(long dirfd, const char* path, long flags, long mask, struct
     long r;
     if (empty(path) && (flags & AT_EMPTY_PATH)) {
         r = sys6(NR_statx, dirfd, (long) path, flags, mask, (long) stx, 0);
+        struct own o;
+        if (r == 0 && (stx->mode & S_IFMT) != S_IFLNK && own_get_fd(dirfd, &o) == 0) { fake_statx_own(r, stx, &o); return r; }
     } else {
         char host[PATH_MAX];
         long nofollow = (flags & ~AT_EMPTY_PATH) | AT_SYMLINK_NOFOLLOW;
@@ -987,7 +1064,7 @@ long emulate_execve(long dirfd, const char* path, char* const* argv, char* const
             struct own o;
             set_ids_mode = st.mode & (S_ISUID | S_ISGID);
             if (own_get_path(host, 1, &o) == 0) {
-                if (o.mode & OWN_MODE_SET) set_ids_mode = o.mode & (S_ISUID | S_ISGID);
+                if ((o.mode & OWN_MODE_SET) && (o.mode & 0777u) == (st.mode & 0777u)) set_ids_mode = o.mode & (S_ISUID | S_ISGID);
                 set_uid_to = o.uid, set_gid_to = o.gid;
             }
         }
@@ -1182,6 +1259,7 @@ static void take_child_root(void) {
         cfg.root_length = n;
         cfg.bind_count = 0;
         set_root_alias();
+        pathcache_reset_local();
         cfg.fs_child = 0;
     } else if (sys(NR_kill, cfg.fs_child, 0, 0, 0) == -ESRCH) {
         cfg.fs_child = 0;
@@ -1341,9 +1419,34 @@ static long do_chroot(const char* path) {
     memcpy(cfg.root, root, n + 1);
     cfg.root_length = n;
     set_root_alias();
+    pathcache_reset_local(); /* entries are guest paths of the old root */
+    pathcache_invalidate();
     record_root();
     if (fs_parent) record_shared_root();
     return 0;
+}
+
+/* listxattr() results without the owner store's own attribute. @r: the list's size or -errno. */
+static long strip_own_name(char* list, long r, long size) {
+    if (r <= 0 || size == 0 || list == 0) return r;
+    long n = sizeof(OWN_XATTR);
+    for (long at = 0; at < r;) {
+        long len = length_of(list + at) + 1;
+        if (len == n && same(list + at, OWN_XATTR)) {
+            memmove(list + at, list + at + len, r - at - len);
+            return r - len;
+        }
+        at += len;
+    }
+    return r;
+}
+
+/* listxattr()/flistxattr() with a size probe (size 0): the real list, less the store's name. */
+static long list_xattr(long nr, long target, char* list, long size) {
+    char tmp[8192];
+    long r = sys6(nr, target, (long) (size ? list : tmp), size ? size : (long) sizeof(tmp), 0, 0, 0);
+    if (size == 0 && r == -ERANGE) return sys6(nr, target, 0, 0, 0, 0, 0); /* too long to filter: as is */
+    return strip_own_name(size ? list : tmp, r, 1);
 }
 
 /* -- Dispatch ------------------------------------------------------------------------------- */
@@ -1358,10 +1461,20 @@ static long emulate(long nr, const uint64_t* x) {
          * refuses: say it is unsupported, so programs (Qt's QTemporaryFile,
          * glibc's tmpfile()) fall back to a named file. */
         if (flags & 020000000 /* __O_TMPFILE */) return -95 /* EOPNOTSUPP */;
+        int stamp = (flags & O_CREAT) && id(FSUID) != 0, existed = 0;
+        if (stamp) { /* a non-root creator: is the file new? */
+            char h[PATH_MAX];
+            struct kstat st;
+            existed = host_path(dirfd, path, 1, h) < 0 || sys(NR_newfstatat, AT_FDCWD, (long) h, (long) &st, 0) == 0;
+        }
         long r = open_direct(dirfd, path, flags, (long) x[3]);
-        if (r != -ELOOP && r != -EINVAL && r != -EACCES) return l2s_path_fd(r, flags);
+        if (r != -ELOOP && r != -EINVAL && r != -EACCES) return stamp && !existed ? own_stamp_fd(l2s_path_fd(r, flags)) : l2s_path_fd(r, flags);
         int follow = !(flags & O_NOFOLLOW) && (flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL);
-        ON_HOST(follow, l2s_path_fd(open_as_root(NR_openat, host, flags, flags, (long) x[3]), flags));
+        char host[PATH_MAX];
+        r = host_path(dirfd, path, follow, host);
+        if (r < 0) return r;
+        r = l2s_path_fd(open_as_root(NR_openat, host, flags, flags, (long) x[3]), flags);
+        return stamp && !existed ? own_stamp_fd(r) : r;
     }
     case NR_openat2: {
         const struct open_how* how = (const struct open_how*) x[2];
@@ -1406,15 +1519,23 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_unshare: return do_unshare((long) x[0]);
     case NR_ptrace: return do_traceme();
     case NR_mprotect: return do_mprotect(x);
-    case NR_mkdirat: ON_HOST(0, sys(NR_mkdirat, AT_FDCWD, host, x[2], 0));
+    case NR_mkdirat: {
+        char host[PATH_MAX];
+        long r = host_path(dirfd, path, 0, host);
+        if (r < 0) return r;
+        r = sys(NR_mkdirat, AT_FDCWD, host, x[2], 0);
+        if (r == 0) own_stamp_path(host);
+        return r;
+    }
     case NR_mknodat: ON_HOST(0, sys(NR_mknodat, AT_FDCWD, host, x[2], x[3]));
     case NR_unlinkat: {
         char host[PATH_MAX];
         long r = host_path(dirfd, path, 0, host);
         if (r < 0) return r;
         if (!(x[2] & 0x200 /* AT_REMOVEDIR */) && (r = l2s_unlinked(host)) < 0) return r;
-        if (x[2] & 0x200) pathcache_invalidate(); /* a directory goes away */
+        if (x[2] & 0x200) pathcache_invalidate(); /* a directory goes away: before and after */
         r = sys(NR_unlinkat, AT_FDCWD, host, x[2], 0);
+        if (x[2] & 0x200) pathcache_invalidate();
         if (r != -EACCES || id(FSUID) != 0) return r;
         /* Root removes from read-only directories too (rm -rf of Go's module cache). */
         long slash = length_of(host);
@@ -1465,13 +1586,16 @@ static long emulate(long nr, const uint64_t* x) {
         if (r < 0) return r;
         /* A faked hard link replaced: one link less. */
         if ((r = l2s_unlinked(to)) < 0) return r;
-        { /* renaming a directory or a symlink changes what paths resolve to */
+        /* renaming a directory or a symlink, or exchanging anything, changes what paths resolve to */
+        int bump = nr == NR_renameat2 && ((long) x[4] & 2 /* RENAME_EXCHANGE */);
+        if (!bump) {
             struct kstat st;
-            if (sys(NR_newfstatat, AT_FDCWD, (long) from, (long) &st, AT_SYMLINK_NOFOLLOW) < 0 ||
-                (st.mode & S_IFMT) != S_IFREG)
-                pathcache_invalidate();
+            bump = sys(NR_newfstatat, AT_FDCWD, (long) from, (long) &st, AT_SYMLINK_NOFOLLOW) < 0 || (st.mode & S_IFMT) != S_IFREG;
         }
-        return sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, nr == NR_renameat ? 0 : (long) x[4], 0);
+        if (bump) pathcache_invalidate();
+        r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, nr == NR_renameat ? 0 : (long) x[4], 0);
+        if (bump) pathcache_invalidate();
+        return r;
     }
     case NR_fchmod: return do_chmod(x[0], "", (long) x[1], AT_EMPTY_PATH);
     case NR_fchmodat: return do_chmod(dirfd, path, (long) x[2], 0);
@@ -1498,7 +1622,16 @@ static long emulate(long nr, const uint64_t* x) {
             return nr == NR_getxattr || nr == NR_lgetxattr ? -ENODATA : -EPERM;
         dirfd = AT_FDCWD;
         path = (const char*) x[0];
+        if (nr == NR_listxattr || nr == NR_llistxattr) ON_HOST(follow, list_xattr(nr, (long) host, (char*) x[1], (long) x[2]));
         ON_HOST(follow, sys6(nr, (long) host, (long) x[1], (long) x[2], (long) x[3], (long) x[4], 0));
+    }
+    case NR_fgetxattr:
+    case NR_fsetxattr:
+    case NR_fremovexattr:
+        if (x[1] && same((const char*) x[1], OWN_XATTR)) return nr == NR_fgetxattr ? -ENODATA : -EPERM;
+        return sys6(nr, (long) x[0], (long) x[1], (long) x[2], (long) x[3], (long) x[4], 0);
+    case NR_flistxattr: {
+        return list_xattr(nr, (long) x[0], (char*) x[1], (long) x[2]);
     }
     case NR_inotify_add_watch:
         dirfd = AT_FDCWD;
@@ -1539,21 +1672,30 @@ static long emulate(long nr, const uint64_t* x) {
         uint32_t* header = (uint32_t*) x[0]; /* version, pid */
         uint32_t* data = (uint32_t*) x[1];   /* 2 x {effective, permitted, inheritable} for v3 */
         if (header == 0) return -EFAULT;
-        if (header[0] != 0x20080522 /* _LINUX_CAPABILITY_VERSION_3 */ && header[0] != 0x20071026 /* v2 */) {
+        int words = header[0] == 0x19980330 /* v1 */ ? 1 : 2;
+        if (header[0] != 0x20080522 /* _LINUX_CAPABILITY_VERSION_3 */ && header[0] != 0x20071026 /* v2 */ && words == 2) {
             header[0] = 0x20080522;
             return data ? -EINVAL : 0;
         }
+        int32_t pid = (int32_t) header[1];
+        if (pid < 0) return -EINVAL;
+        if (pid != 0 && pid != sys(NR_getpid, 0, 0, 0, 0) && sys(NR_kill, pid, 0, 0, 0) == -ESRCH) return -ESRCH;
         if (data) {
+            /* another process's: its ids are not known here, so the caller's rule is shown */
             uint32_t all = id(EUID) == 0 ? 0xffffffffu : 0;
-            for (int i = 0; i < 2; i++) data[i * 3] = all, data[i * 3 + 1] = all, data[i * 3 + 2] = 0;
-            data[3] &= 0x1ff, data[4] &= 0x1ff; /* capabilities 32..40 */
+            for (int i = 0; i < words; i++) data[i * 3] = all, data[i * 3 + 1] = all, data[i * 3 + 2] = 0;
+            if (words == 2) data[3] &= 0x1ff, data[4] &= 0x1ff; /* capabilities 32..40 */
         }
         return 0;
     }
     case NR_capset: {
         uint32_t* header = (uint32_t*) x[0];
         if (header == 0) return -EFAULT;
-        if (header[0] != 0x20080522 && header[0] != 0x20071026) return -EINVAL;
+        if (header[0] != 0x20080522 && header[0] != 0x20071026 && header[0] != 0x19980330) return -EINVAL;
+        if (header[1] != 0 && (int32_t) header[1] != (int32_t) sys(NR_getpid, 0, 0, 0, 0)) return -EPERM;
+        /* No state is kept: a later capget() shows the full set again, and any set is accepted
+         * (a daemon that switches users keeping some capabilities, as dbus-daemon does, calls
+         * this as non-root). Guest users are not a security boundary (plan, Constraints). */
         return 0;
     }
     case NR_getuid: return id(RUID);

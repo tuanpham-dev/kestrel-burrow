@@ -42,7 +42,7 @@
 /* -- Kernel interface (arm64, asm-generic) ------------------------------------ */
 
 enum {
-    NR_setxattr = 5, NR_lsetxattr = 6, NR_fsetxattr = 7, NR_getxattr = 8, NR_fgetxattr = 10, NR_lgetxattr = 9, NR_listxattr = 11, NR_llistxattr = 12,
+    NR_setxattr = 5, NR_lsetxattr = 6, NR_fsetxattr = 7, NR_getxattr = 8, NR_fgetxattr = 10, NR_flistxattr = 13, NR_fremovexattr = 16, NR_lgetxattr = 9, NR_listxattr = 11, NR_llistxattr = 12,
     NR_removexattr = 14, NR_lremovexattr = 15, NR_getcwd = 17, NR_fcntl = 25, NR_ioctl = 29, NR_inotify_add_watch = 27,
     NR_mknodat = 33, NR_mkdirat = 34, NR_unlinkat = 35, NR_symlinkat = 36, NR_linkat = 37, NR_renameat = 38,
     NR_statfs = 43, NR_fstatfs = 44, NR_fchmod = 52, NR_truncate = 45, NR_faccessat = 48, NR_chdir = 49, NR_chroot = 51, NR_fchmodat = 53, NR_fchownat = 54,
@@ -203,6 +203,7 @@ struct config {
     char name[16];           /* its process name: the file execve() was given */
     uint16_t dns_port;       /* the app's DNS proxy on 127.0.0.1, 0 if none */
     char stats[512];         /* the statistics file (-s), a host path; empty if none */
+    char pathgen[512];       /* Kestrel: the path cache's shared counter (-g), a host path outside the rootfs; empty: no cache */
     char ipc[512];           /* SysV IPC's directory, a host path: in the first root, which chroot() keeps */
     int fs_child;            /* a child sharing the root (clone(CLONE_FS)) whose chroot() is still to come, else 0 */
     char hostname[65];       /* the guest's /etc/hostname at launch, uname()'s nodename; empty for the kernel's */
@@ -276,6 +277,8 @@ int guest_sees(const char* host);
 long host_fd(long dirfd, const char* path, int follow, char* host, long* fd);
 /* Path cache (Kestrel): forget every cached directory, in every guest process. */
 void pathcache_invalidate(void);
+/* Path cache (Kestrel): forget this process's cached directories (its root changed). */
+void pathcache_reset_local(void);
 /* openat() in one walk, when the kernel resolves the path as we would: a
  * plain path and no symlink. -ELOOP, -EINVAL (openat2() is stricter) and
  * -EACCES (the fake root's permissions) mean taking to_host()'s way. */

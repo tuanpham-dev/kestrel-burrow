@@ -303,27 +303,47 @@ struct dirslot { uint64_t key, meta, check; }; /* meta: generation << 16 | lengt
 static struct dirslot dircache[DIRCACHE_SLOTS];
 static uint64_t* volatile pathgen; /* shared counter; 0 until mapped, (uint64_t*) 1 if unavailable */
 
+/* The counter lives in a file given with -g (the app's private state directory, outside the
+ * rootfs, so no guest program can truncate or remove it). Without -g there is no cache. */
+static uint64_t* map_counter(void) {
+    if (cfg.pathgen[0] == 0) return 0;
+    long fd = sys(NR_openat, AT_FDCWD, (long) cfg.pathgen, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return 0;
+    struct kstat st;
+    if (sys(NR_fstat, fd, &st, 0, 0) < 0 || (st.size < 4096 && sys(46 /* NR_ftruncate */, fd, 4096, 0, 0) < 0)) {
+        sys(NR_close, fd, 0, 0, 0);
+        return 0;
+    }
+    long m = sys6(NR_mmap, 0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    sys(NR_close, fd, 0, 0, 0);
+    return m < 0 && m > -4096 ? 0 : (uint64_t*) m;
+}
+
 static uint64_t* gen_counter(void) {
     uint64_t* g = pathgen;
     if (g == (uint64_t*) 1) return 0;
     if (g) return g;
-    char p[PATH_MAX];
-    long n = copy(p, PATH_MAX - 32, cfg.root);
-    if (n < 0) { pathgen = (uint64_t*) 1; return 0; }
-    memcpy(p + n, "/.kestrel-pathgen", 18);
-    long fd = sys(NR_openat, AT_FDCWD, (long) p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0) { pathgen = (uint64_t*) 1; return 0; }
-    sys(46 /* NR_ftruncate */, fd, 4096, 0, 0);
-    long m = sys6(NR_mmap, 0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    sys(NR_close, fd, 0, 0, 0);
-    if (m < 0 && m > -4096) { pathgen = (uint64_t*) 1; return 0; }
-    pathgen = (uint64_t*) m;
-    return pathgen;
+    g = map_counter();
+    pathgen = g ? g : (uint64_t*) 1; /* no cache in this process if the counter cannot be mapped */
+    return g;
 }
 
+/* Bumps reach every process: one that cannot map the counter retries here (bumps are rare). */
 void pathcache_invalidate(void) {
     uint64_t* g = gen_counter();
+    if (!g && cfg.pathgen[0]) {
+        g = map_counter();
+        if (g) pathgen = g;
+        else say("burrow: cannot update the path cache counter ", cfg.pathgen, 0);
+    }
     if (g) __atomic_add_fetch(g, 1, __ATOMIC_RELEASE);
+}
+
+void pathcache_reset_local(void) { memset(dircache, 0, sizeof(dircache)); }
+
+static uint64_t gen_now(void) {
+    uint64_t* g = gen_counter();
+    return g ? __atomic_load_n(g, __ATOMIC_ACQUIRE) : 0;
 }
 
 static uint64_t fnv(const char* s, long n) {
@@ -342,10 +362,11 @@ static int dircache_has(const char* p, long n) {
     return k == key && c == (k ^ m ^ 0x9e3779b97f4a7c15ull) && m == (gen << 16 | (uint64_t) (n & 0xffff));
 }
 
-static void dircache_put(const char* p, long n) {
-    uint64_t* g = gen_counter();
-    if (!g) return;
-    uint64_t key = fnv(p, n), meta = __atomic_load_n(g, __ATOMIC_ACQUIRE) << 16 | (uint64_t) (n & 0xffff);
+/* @gen: the counter read BEFORE the lstat() that saw the directory, so a change racing with
+ * that lstat() (bumped after it) makes this entry stale at once. */
+static void dircache_put(const char* p, long n, uint64_t gen) {
+    if (!gen_counter()) return;
+    uint64_t key = fnv(p, n), meta = gen << 16 | (uint64_t) (n & 0xffff);
     struct dirslot* s = &dircache[key % DIRCACHE_SLOTS];
     __atomic_store_n(&s->check, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&s->key, key, __ATOMIC_RELAXED);
@@ -402,6 +423,7 @@ static long walk(const char* path, int follow, char* host, char* out) {
         struct kstat st;
         long r = host_of(out, n, host);
         if (r < 0) return r;
+        uint64_t gen = gen_now();
         r = sys(NR_newfstatat, AT_FDCWD, host, &st, AT_SYMLINK_NOFOLLOW);
         if (r == -ENOENT && last) break; /* to be created */
         if (r < 0) return r;
@@ -438,7 +460,7 @@ static long walk(const char* path, int follow, char* host, char* out) {
             continue;
         }
         if (!last && (st.mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
-        if (!last && b == 0) dircache_put(out, n);
+        if (!last && b == 0) dircache_put(out, n, gen);
         if (last) break;
     }
     long h = host_of(out, n, host);

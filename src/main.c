@@ -146,14 +146,27 @@ static void kill_tree(void) {
     }
 }
 
+/* Kestrel: a stop request first asks the guest's first process to stop (SIGTERM, its own
+ * ordered shutdown: kestrel-init), and kills the whole tree only after 5 s or a second request. */
 static __attribute__((noreturn)) void supervise(long child) {
     main_child = child;
+    int asked = 0, ticks = 0;
     while (main_status < 0) {
         int status;
-        long r = sys(NR_wait4, -1, &status, 0, 0);
-        if (r > 0) reaped(r, status);
-        else if (r == -EINTR && stop_requested) kill_tree();
-        else if (r != -EINTR) break; /* ECHILD */
+        long r = sys(NR_wait4, -1, &status, asked ? 1 /* WNOHANG */ : 0, 0);
+        if (r > 0) { reaped(r, status); continue; }
+        if (stop_requested && !asked) {
+            asked = 1, stop_requested = 0;
+            sys(NR_kill, main_child, 15 /* SIGTERM */, 0, 0);
+            continue;
+        }
+        if (asked) {
+            if (stop_requested || ++ticks > 50) { kill_tree(); break; }
+            struct { long s, ns; } t = {0, 100000000};
+            sys(101 /* NR_nanosleep */, (long) &t, 0, 0, 0);
+            continue;
+        }
+        if (r != -EINTR) break; /* ECHILD */
     }
     kill_tree();
     int s = main_status;
@@ -183,13 +196,17 @@ static void launch(long argc, char** argv, char** envp) {
             if (*p || port == 0 || port > 65535) die("bad DNS port ", argv[i]);
             cfg.dns_port = (uint16_t) port;
         }
+        else if (same(a, "-g")) {
+            const char* p = argv[++i];
+            if (p[0] != '/' || copy(cfg.pathgen, sizeof(cfg.pathgen), p) < 0) die("bad path cache counter file ", p);
+        }
         else if (same(a, "-s")) {
             const char* p = argv[++i];
             if (p[0] != '/' || copy(cfg.stats, sizeof(cfg.stats), p) < 0) die("bad statistics file ", p);
         }
         else die("unknown option ", a);
     }
-    if (root == 0 || i >= argc) die("usage: burrow -r ROOTFS [-b HOST[:GUEST]]... [-w DIR] [-d DNS_PORT] [-s STATS_FILE] PROGRAM [ARG]...", 0);
+    if (root == 0 || i >= argc) die("usage: burrow -r ROOTFS [-b HOST[:GUEST]]... [-w DIR] [-d DNS_PORT] [-s STATS_FILE] [-g PATHGEN_FILE] PROGRAM [ARG]...", 0);
 
     long fd = sys(NR_openat, AT_FDCWD, root, O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
     if (fd < 0 || (cfg.root_length = fd_path(fd, cfg.root, sizeof(cfg.root))) <= 1) die("cannot open the rootfs ", root);
