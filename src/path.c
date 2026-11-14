@@ -58,6 +58,22 @@ static int under(const char* s, const char* prefix, long n) {
 
 /* The guest path of @host: its directory there in @guest, the rest of it in
  * @rest, null when the guest cannot see it. */
+/* @p (@n bytes) under the app data directory's other name (see set_root_alias()) in @out;
+ * the length, or -1 when @p is under neither name or does not fit. */
+static long other_name(const char* p, long n, char* out, long size) {
+    static const char* const pairs[][2] = {{"/data/user/0/", "/data/data/"}, {"/data/data/", "/data/user/0/"}};
+    for (unsigned i = 0; i < 2; i++) {
+        long from = length_of(pairs[i][0]), to = length_of(pairs[i][1]);
+        if (n < from || memcmp(p, pairs[i][0], from) != 0) continue;
+        if (to + n - from >= size) return -1;
+        memcpy(out, pairs[i][1], to);
+        memcpy(out + to, p + from, n - from);
+        out[to + n - from] = 0;
+        return to + n - from;
+    }
+    return -1;
+}
+
 static const char* guest_part(const char* host, const char** guest) {
     const char* rest = 0;
     long best = 0;
@@ -70,19 +86,14 @@ static const char* guest_part(const char* host, const char** guest) {
         long n = b->host_length;
         if (n > best && under(host, b->host, n)) {
             best = n, rest = host + n, *guest = b->guest;
-        } else if (cfg.root_alias_length > 0) {
-            /* A binding of a directory of the rootfs, named by the rootfs's other path
-             * (/data/data or /data/user/0): the kernel may give either. */
-            int in_root = under(b->host, cfg.root, cfg.root_length);
-            if (!in_root && !under(b->host, cfg.root_alias, cfg.root_alias_length)) continue;
-            const char* other = in_root ? cfg.root_alias : cfg.root;
-            long from = in_root ? cfg.root_length : cfg.root_alias_length;
-            long to = in_root ? cfg.root_alias_length : cfg.root_length;
-            long tail = n - from;
-            n = to + tail;
-            if (n > best && under(host, other, to) && memcmp(host + to, b->host + from, tail) == 0 &&
-                (host[n] == 0 || host[n] == '/'))
-                best = n, rest = host + n, *guest = b->guest;
+        } else {
+            /* The binding's directory named by the data directory's other path: Android shows
+             * the app's data both as /data/user/0/<package> and /data/data/<package>, and the
+             * kernel may give either (getcwd() inside the session gave the other one for a
+             * binding beside the rootfs, so relative paths there resolved outside it). */
+            char alias[PATH_MAX];
+            long a = other_name(b->host, n, alias, sizeof(alias));
+            if (a > best && under(host, alias, a)) best = a, rest = host + a, *guest = b->guest;
         }
     }
     return rest;
