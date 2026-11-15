@@ -1149,6 +1149,25 @@ long emulate_execve(long dirfd, const char* path, char* const* argv, char* const
     return r;
 }
 
+/* Root writes into read-only directories too (Fedora's /root is 0550; real root ignores
+ * directory permissions): when the fake root is refused there, the app-owned directory holding
+ * @host gets u+wx for the time of the call. lend_dir() says whether it lent, unlend_dir() gives
+ * the mode back. */
+static int lend_dir(const char* host, char* dir, uint32_t* mode) {
+    if (id(FSUID) != 0) return 0;
+    long s = length_of(host);
+    while (s > 0 && host[s] != '/') s--;
+    if (s == 0 || s >= PATH_MAX) return 0;
+    for (long i = 0; i < s; i++) dir[i] = host[i];
+    dir[s] = 0;
+    struct kstat st;
+    if (sys(NR_newfstatat, AT_FDCWD, dir, &st, 0) < 0 || st.uid != cfg.real_uid || (st.mode & 0300) == 0300) return 0;
+    if (sys(NR_fchmodat, AT_FDCWD, dir, (st.mode & 07777) | 0300, 0) < 0) return 0;
+    *mode = st.mode & 07777;
+    return 1;
+}
+static void unlend_dir(const char* dir, uint32_t mode) { sys(NR_fchmodat, AT_FDCWD, dir, mode, 0); }
+
 /* openat()/openat2() of @host; @a and @b are the call's third and fourth
  * arguments. Root opens files whatever their mode: when the fake root is
  * refused a file of the app's, it gets the permission it lacks for the time
@@ -1168,7 +1187,16 @@ static long open_as_root(long nr, const char* host, long flags, long a, long b) 
     if (proc >= 0) return proc_open(proc, flags);
     if (r != -EACCES || id(FSUID) != 0 || (flags & O_PATH)) return r;
     struct kstat st;
-    if (sys(NR_newfstatat, AT_FDCWD, host, &st, 0) < 0 || st.uid != cfg.real_uid) return r;
+    if (sys(NR_newfstatat, AT_FDCWD, host, &st, 0) < 0) {
+        /* a new file in a read-only directory */
+        char dir[PATH_MAX];
+        uint32_t mode;
+        if (!(flags & O_CREAT) || !lend_dir(host, dir, &mode)) return r;
+        r = sys(nr, AT_FDCWD, host, a, b);
+        unlend_dir(dir, mode);
+        return r;
+    }
+    if (st.uid != cfg.real_uid) return r;
     uint32_t need = (flags & 3) == 0 ? 0400 : (flags & 3) == 1 ? 0200 : 0600;
     if ((st.mode & need) == need) return r;
     if (sys(NR_fchmodat, AT_FDCWD, host, (st.mode & 07777) | need, 0) < 0) return r;
@@ -1530,6 +1558,12 @@ static long emulate(long nr, const uint64_t* x) {
         long r = host_path(dirfd, path, 0, host);
         if (r < 0) return r;
         r = sys(NR_mkdirat, AT_FDCWD, host, x[2], 0);
+        char dir[PATH_MAX];
+        uint32_t mode;
+        if (r == -EACCES && lend_dir(host, dir, &mode)) {
+            r = sys(NR_mkdirat, AT_FDCWD, host, x[2], 0);
+            unlend_dir(dir, mode);
+        }
         if (r == 0) own_stamp_path(host);
         return r;
     }
@@ -1561,7 +1595,16 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_symlinkat: {
         dirfd = (long) (int) x[1];
         path = (const char*) x[2];
-        ON_HOST(0, sys(NR_symlinkat, x[0], AT_FDCWD, host, 0));
+        char host[PATH_MAX], dir[PATH_MAX];
+        uint32_t mode;
+        long r = host_path(dirfd, path, 0, host);
+        if (r < 0) return r;
+        r = sys(NR_symlinkat, x[0], AT_FDCWD, host, 0);
+        if (r == -EACCES && lend_dir(host, dir, &mode)) {
+            r = sys(NR_symlinkat, x[0], AT_FDCWD, host, 0);
+            unlend_dir(dir, mode);
+        }
+        return r;
     }
     case NR_linkat: {
         char from[PATH_MAX], to[PATH_MAX];
@@ -1599,7 +1642,16 @@ static long emulate(long nr, const uint64_t* x) {
             bump = sys(NR_newfstatat, AT_FDCWD, (long) from, (long) &st, AT_SYMLINK_NOFOLLOW) < 0 || (st.mode & S_IFMT) != S_IFREG;
         }
         if (bump) pathcache_invalidate();
-        r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, nr == NR_renameat ? 0 : (long) x[4], 0);
+        long rflags = nr == NR_renameat ? 0 : (long) x[4];
+        r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, rflags, 0);
+        if (r == -EACCES) {
+            char d1[PATH_MAX], d2[PATH_MAX];
+            uint32_t m1 = 0, m2 = 0;
+            int l1 = lend_dir(from, d1, &m1), l2 = lend_dir(to, d2, &m2);
+            if (l1 || l2) r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, rflags, 0);
+            if (l2) unlend_dir(d2, m2);
+            if (l1) unlend_dir(d1, m1);
+        }
         if (bump) pathcache_invalidate();
         return r;
     }
