@@ -1070,6 +1070,12 @@ long emulate_execve(long dirfd, const char* path, char* const* argv, char* const
         }
         r = sys(NR_faccessat, AT_FDCWD, host, X_OK, 0);
         if (r < 0) return r;
+        /* An execute-only program (Fedora ships sudo as 4111): every file is the app's, and the
+         * app must read a program to start it (its head here, its segments in the loader), so
+         * the owner gets read permission, for good (the guest then sees 4511). */
+        if (st.uid == cfg.real_uid && !(st.mode & 0400) &&
+            sys(NR_fchmodat, AT_FDCWD, host, (st.mode & 07777) | 0400, 0) == -EPERM)
+            sys(NR_fchmodat, AT_FDCWD, host, (st.mode & 0777) | 0400, 0);
         long fd = sys(NR_openat, AT_FDCWD, host, O_RDONLY | O_CLOEXEC, 0);
         if (fd < 0) return fd;
         char* h = heads[depth];
