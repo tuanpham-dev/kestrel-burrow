@@ -1231,6 +1231,24 @@ static int readable_sysfs_dir(const char* host) {
     return (st.mode & S_IFMT) == S_IFDIR && (st.mode & 05) == 05;
 }
 
+/* An empty directory for a /sys directory SELinux will not open although its
+ * mode lets everyone read it (readable_sysfs_dir()): access() says it is
+ * readable, and a program that then cannot open it may give up for good
+ * (libpci exits: Chromium's GPU process, so no WebGL). On a phone such a
+ * directory (/sys/bus/pci/devices) has nothing a program could use. */
+static long open_empty_dir(long flags) {
+    char p[sizeof(cfg.root) + 24];
+    memcpy(p, cfg.root, cfg.root_length);
+    memcpy(p + cfg.root_length, "/tmp/.burrow-empty", 19);
+    long how = O_RDONLY | O_DIRECTORY | (flags & O_CLOEXEC);
+    long r = sys(NR_openat, AT_FDCWD, p, how, 0);
+    if (r == -ENOENT) { /* the first time (or /tmp was emptied) */
+        sys(NR_mkdirat, AT_FDCWD, p, 0555, 0);
+        r = sys(NR_openat, AT_FDCWD, p, how, 0);
+    }
+    return r;
+}
+
 /* faccessat() and faccessat2(): the made-up files of /proc are readable, and
  * so are the directories of /sys as on Linux. */
 static long do_access(long dirfd, const char* path, long mode, long flags) {
@@ -1508,6 +1526,7 @@ static long emulate(long nr, const uint64_t* x) {
         r = host_path(dirfd, path, follow, host);
         if (r < 0) return r;
         r = l2s_path_fd(open_as_root(NR_openat, host, flags, flags, (long) x[3]), flags);
+        if (r == -EACCES && (flags & 3) == O_RDONLY && !(flags & O_CREAT) && readable_sysfs_dir(host)) return open_empty_dir(flags);
         return stamp && !existed ? own_stamp_fd(r) : r;
     }
     case NR_openat2: {
