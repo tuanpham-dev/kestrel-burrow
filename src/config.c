@@ -65,7 +65,7 @@ long encode_config(char* to, long size, const char* exe, const char* host_exe, c
     for (int i = 0; i < cfg.bind_count; i++) {
         at = put(at, end, cfg.binds[i].guest);
         at = put(at, end, cfg.binds[i].host);
-        at = put_number(at, end, (unsigned long) cfg.binds[i].walked);
+        at = put_number(at, end, (unsigned long) (cfg.binds[i].walked | cfg.binds[i].readonly << 1));
     }
     if (at == 0) return -E2BIG;
     at[-1] = 0;
@@ -127,7 +127,8 @@ int decode_config(const char* s) {
         struct bind* b = &cfg.binds[i];
         if (!take(&s, b->guest, sizeof(b->guest)) || !take(&s, b->host, sizeof(b->host)) || !take_number(&s, &v))
             return 0;
-        b->walked = v != 0;
+        b->walked = (v & 1) != 0;
+        b->readonly = (v & 2) != 0;
         b->guest_length = length_of(b->guest);
         b->host_length = length_of(b->host);
     }

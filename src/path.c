@@ -99,6 +99,54 @@ static const char* guest_part(const char* host, const char** guest) {
     return rest;
 }
 
+static int under_read_only(const char* host) {
+    for (int i = 0; i < cfg.bind_count; i++) {
+        const struct bind* b = &cfg.binds[i];
+        if (b->readonly && under(host, b->host, b->host_length)) return 1;
+    }
+    return 0;
+}
+
+/* Whether @host is in a read-only binding. A /proc path through a descriptor, the working
+ * directory or the root (/proc/self/fd/N, .../cwd, .../root, with a rest or not) is judged by
+ * the file it leads to. */
+int read_only_host(const char* host) {
+    if (under_read_only(host)) return 1;
+    if (!starts_with(host, "/proc/")) return 0;
+    const char* p = host + 6;
+    while (*p && *p != '/') p++; /* the pid or "self" */
+    if (*p != '/') return 0;
+    p++;
+    const char* end = p;
+    if (starts_with(p, "fd/")) {
+        end = p + 3;
+        while (*end && *end != '/') end++;
+    } else if (starts_with(p, "cwd") && (p[3] == 0 || p[3] == '/')) {
+        end = p + 3;
+    } else if (starts_with(p, "root") && (p[4] == 0 || p[4] == '/')) {
+        end = p + 4;
+    } else {
+        return 0;
+    }
+    long prefix = end - host, rest = length_of(end);
+    if (prefix >= PATH_MAX) return 0;
+    char link[PATH_MAX], target[PATH_MAX];
+    memcpy(link, host, prefix);
+    link[prefix] = 0;
+    long n = sys(NR_readlinkat, AT_FDCWD, link, target, sizeof(target) - 1);
+    if (n <= 0 || target[0] != '/' || n + rest >= PATH_MAX) return 0;
+    memcpy(target + n, end, rest + 1);
+    return under_read_only(target);
+}
+
+/* Whether descriptor @fd is a file in a read-only binding (the host path of its file). */
+int read_only_fd(long fd) {
+    char host[PATH_MAX];
+    return fd_path(fd, host, PATH_MAX) > 0 && host[0] == '/' && under_read_only(host);
+}
+
+long ro_guard(const char* host) { return read_only_host(host) ? -EROFS : 0; }
+
 int guest_sees(const char* host) {
     const char* guest;
     return guest_part(host, &guest) != 0;

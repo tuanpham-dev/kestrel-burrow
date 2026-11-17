@@ -29,6 +29,7 @@ static const uint16_t trapped[] = {
     NR_sendto, NR_getsockname, NR_getpeername, NR_shmget, NR_shmctl, NR_shmat, NR_shmdt, NR_chroot,
     NR_semget, NR_semctl, NR_semtimedop, NR_semop, NR_msgget, NR_msgctl, NR_msgrcv, NR_msgsnd,
     NR_capget, NR_capset,
+    NR_fchmod, NR_fsetxattr, NR_fremovexattr, /* descriptors of a read-only binding's files */
     NR_clone3, /* ENOSYS, as under Android: CLONE_CLEAR_SIGHAND would drop our handler */
     NR_mount, NR_umount2, NR_unshare,
     /* ENOSYS: the new mount API takes paths we would not translate (libglnx,
@@ -91,11 +92,13 @@ long install_filter(void) {
     /* socket(AF_NETLINK, *, NETLINK_AUDIT): SELinux says EACCES, which PAM
      * takes for a broken audit system (su and sudo fail); a kernel without
      * audit says EPROTONOSUPPORT. Burrow makes no such socket itself. */
-    f[i++] = (struct sock_filter){JEQ, 0, 6, NR_socket};
+    /* socket(AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) traps, see do_uevent_socket(). */
+    f[i++] = (struct sock_filter){JEQ, 0, 7, NR_socket};
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 16}; /* args[0], low half */
-    f[i++] = (struct sock_filter){JEQ, 0, 2, 16 /* AF_NETLINK */};
+    f[i++] = (struct sock_filter){JEQ, 0, 3, 16 /* AF_NETLINK */};
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 32}; /* args[2], low half */
-    f[i++] = (struct sock_filter){JEQ, 1, 0, 9 /* NETLINK_AUDIT */};
+    f[i++] = (struct sock_filter){JEQ, 2, 0, 9 /* NETLINK_AUDIT */};
+    f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, 15 /* NETLINK_KOBJECT_UEVENT */};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ERRNO | 93 /* EPROTONOSUPPORT */};
     /* clone(CLONE_NEWPID) is EINVAL, as from a kernel without PID namespaces
@@ -432,6 +435,24 @@ static void fake_statx(long r, struct kstatx* stx) { fake_statx_own(r, stx, 0); 
         return r_ < 0 ? r_ : (call);                             \
     } while (0)
 
+/* ON_HOST() that first runs @guard (a negative result, such as ro_guard(host), ends the call with it). */
+#define ON_HOST_RO(follow, guard, call)                          \
+    do {                                                         \
+        char host[PATH_MAX];                                     \
+        long r_ = host_path(dirfd, path, (follow), host);        \
+        if (r_ >= 0) r_ = (guard);                               \
+        return r_ < 0 ? r_ : (call);                             \
+    } while (0)
+
+/* An open of @host for @flags: refused in a read-only binding when it writes or makes the file. */
+static long ro_open(const char* host, long flags) {
+    if (!read_only_host(host) || (flags & O_PATH)) return 0;
+    struct kstat st;
+    if ((flags & 3) != O_RDONLY || (flags & O_TRUNC)) return -EROFS;
+    if ((flags & O_CREAT) && sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, 0) < 0) return -EROFS;
+    return 0;
+}
+
 static int empty(const char* path) { return path != 0 && path[0] == 0; }
 
 #define SYSFS_MAGIC 0x62656572
@@ -558,6 +579,7 @@ static long do_chown(long dirfd, const char* path, long uid, long gid, long flag
     struct own o;
     long r;
     if (empty(path) && (flags & AT_EMPTY_PATH)) {
+        if (read_only_fd(dirfd)) return -EROFS;
         if ((r = sys(NR_fstat, dirfd, &st, 0, 0)) < 0) return r;
         if (own_get_fd(dirfd, &o)) own_current(&st, &o);
         if ((r = own_chown(&o, (uint32_t) uid, (uint32_t) gid)) < 0) return r;
@@ -566,7 +588,7 @@ static long do_chown(long dirfd, const char* path, long uid, long gid, long flag
     }
     char host[PATH_MAX];
     int follow = !(flags & AT_SYMLINK_NOFOLLOW);
-    if ((r = host_path(dirfd, path, follow, host)) < 0) return r;
+    if ((r = host_path(dirfd, path, follow, host)) < 0 || (r = ro_guard(host)) < 0) return r;
     if ((r = sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, follow ? 0 : AT_SYMLINK_NOFOLLOW)) < 0) return r;
     if ((st.mode & S_IFMT) == S_IFLNK) {
         /* a faked hard link (link2symlink): its owner is its file's */
@@ -599,6 +621,7 @@ static long do_chmod(long dirfd, const char* path, long mode, long flags) {
     long r;
     int follow = !(flags & AT_SYMLINK_NOFOLLOW);
     if (empty(path) && (flags & AT_EMPTY_PATH)) {
+        if (read_only_fd(dirfd)) return -EROFS;
         if ((r = sys(NR_fstat, dirfd, &st, 0, 0)) < 0) return r;
         int have = own_get_fd(dirfd, &o) == 0;
         if (!have) own_current(&st, &o);
@@ -618,7 +641,7 @@ static long do_chmod(long dirfd, const char* path, long mode, long flags) {
         }
         return 0;
     }
-    if ((r = host_path(dirfd, path, follow, host)) < 0) return r;
+    if ((r = host_path(dirfd, path, follow, host)) < 0 || (r = ro_guard(host)) < 0) return r;
     if ((r = sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, AT_SYMLINK_NOFOLLOW)) < 0) return r;
     if ((st.mode & S_IFMT) == S_IFLNK) {
         /* not followed (AT_SYMLINK_NOFOLLOW): a faked hard link is its file; a symlink's mode
@@ -748,7 +771,7 @@ static long socket_address(const char* addr, long length, int follow, void* un, 
     memcpy(path, addr + 2, n);
     path[n] = 0;
     long r = host_path(AT_FDCWD, path, follow, host);
-    if (r < 0) return r;
+    if (r < 0 || (!follow && (r = ro_guard(host)) < 0)) return r; /* bind() makes the file */
     long h = length_of(host);
     if (h >= 108) {
         long slash = h;
@@ -943,6 +966,17 @@ static long do_peercred(const uint64_t* x) {
     if (cred[1] == cfg.real_uid) cred[1] = known ? ids[EUID] : 0;
     if (cred[2] == cfg.real_gid) cred[2] = known ? ids[EGID] : 0;
     return r;
+}
+
+/* socket(AF_NETLINK, *, NETLINK_KOBJECT_UEVENT): SELinux refuses it to apps
+ * (EACCES), so libudev has no monitor, and KWin 6.8's GpuManager dereferences
+ * the missing monitor at start. A route socket stands in, Burrow's own once
+ * bound (netlink.c): bind() succeeds and no uevent ever comes, as on a system
+ * where nothing is plugged in. */
+static long do_uevent_socket(const uint64_t* x) {
+    long r = sys(NR_socket, x[0], x[1], x[2], 0);
+    if (r != -EACCES || x[0] != 16 /* AF_NETLINK */ || x[2] != 15) return r;
+    return sys(NR_socket, x[0], x[1], 0 /* NETLINK_ROUTE */, 0);
 }
 
 /* DRM_IOCTL_VERSION: the guest's render node is KGSL, which knows no DRM
@@ -1356,6 +1390,7 @@ static long add_binding(const char* guest, long g, const char* host, long h, int
     b->guest_length = g;
     b->host_length = h;
     b->walked = walked;
+    b->readonly = read_only_host(host); /* a bind mount of a read-only binding's files is read-only too */
     if (i == cfg.bind_count) cfg.bind_count++;
     return 0;
 }
@@ -1464,6 +1499,7 @@ static long do_chroot(const char* path) {
         memmove(k->host, b->host, b->host_length + 1);
         k->host_length = b->host_length;
         k->walked = b->walked;
+        k->readonly = b->readonly;
         k->guest_length = b->guest_length - g;
         memmove(k->guest, b->guest + g, k->guest_length + 1);
     }
@@ -1525,6 +1561,7 @@ static long emulate(long nr, const uint64_t* x) {
         char host[PATH_MAX];
         r = host_path(dirfd, path, follow, host);
         if (r < 0) return r;
+        if ((r = ro_open(host, flags)) < 0) return r;
         r = l2s_path_fd(open_as_root(NR_openat, host, flags, flags, (long) x[3]), flags);
         if (r == -EACCES && (flags & 3) == O_RDONLY && !(flags & O_CREAT) && readable_sysfs_dir(host)) return open_empty_dir(flags);
         return stamp && !existed ? own_stamp_fd(r) : r;
@@ -1537,7 +1574,7 @@ static long emulate(long nr, const uint64_t* x) {
         if (how == 0) return -EFAULT;
         if (how->resolve != 0) return -ENOSYS;
         int follow = !(how->flags & O_NOFOLLOW) && (how->flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL);
-        ON_HOST(follow, l2s_path_fd(open_as_root(NR_openat2, host, (long) how->flags, (long) how, (long) x[3]),
+        ON_HOST_RO(follow, ro_open(host, (long) how->flags), l2s_path_fd(open_as_root(NR_openat2, host, (long) how->flags, (long) how, (long) x[3]),
                                     (long) how->flags));
     }
     case NR_getdents64: {
@@ -1575,7 +1612,7 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_mkdirat: {
         char host[PATH_MAX];
         long r = host_path(dirfd, path, 0, host);
-        if (r < 0) return r;
+        if (r < 0 || (r = ro_guard(host)) < 0) return r;
         r = sys(NR_mkdirat, AT_FDCWD, host, x[2], 0);
         char dir[PATH_MAX];
         uint32_t mode;
@@ -1586,11 +1623,11 @@ static long emulate(long nr, const uint64_t* x) {
         if (r == 0) own_stamp_path(host);
         return r;
     }
-    case NR_mknodat: ON_HOST(0, sys(NR_mknodat, AT_FDCWD, host, x[2], x[3]));
+    case NR_mknodat: ON_HOST_RO(0, ro_guard(host), sys(NR_mknodat, AT_FDCWD, host, x[2], x[3]));
     case NR_unlinkat: {
         char host[PATH_MAX];
         long r = host_path(dirfd, path, 0, host);
-        if (r < 0) return r;
+        if (r < 0 || (r = ro_guard(host)) < 0) return r;
         if (!(x[2] & 0x200 /* AT_REMOVEDIR */) && (r = l2s_unlinked(host)) < 0) return r;
         if (x[2] & 0x200) pathcache_invalidate(); /* a directory goes away: before and after */
         r = sys(NR_unlinkat, AT_FDCWD, host, x[2], 0);
@@ -1617,7 +1654,7 @@ static long emulate(long nr, const uint64_t* x) {
         char host[PATH_MAX], dir[PATH_MAX];
         uint32_t mode;
         long r = host_path(dirfd, path, 0, host);
-        if (r < 0) return r;
+        if (r < 0 || (r = ro_guard(host)) < 0) return r;
         r = sys(NR_symlinkat, x[0], AT_FDCWD, host, 0);
         if (r == -EACCES && lend_dir(host, dir, &mode)) {
             r = sys(NR_symlinkat, x[0], AT_FDCWD, host, 0);
@@ -1640,7 +1677,10 @@ static long emulate(long nr, const uint64_t* x) {
         }
         if (r < 0) return r;
         r = host_path((long) (int) x[2], (const char*) x[3], 0, to);
-        if (r < 0) return r;
+        if (r < 0 || (r = ro_guard(to)) < 0) return r;
+        /* A second name for a file of a read-only binding would be a writable one (and the
+         * link2symlink fallback would move the file): the caller copies instead. */
+        if (read_only_host(from)) return -EXDEV;
         r = sys6(NR_linkat, AT_FDCWD, (long) from, AT_FDCWD, (long) to, flags & AT_SYMLINK_FOLLOW, 0);
         return r == -EACCES || r == -EPERM ? l2s_link(from, to) : r;
     }
@@ -1648,10 +1688,10 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_renameat2: {
         char from[PATH_MAX];
         long r = host_path(dirfd, path, 0, from);
-        if (r < 0) return r;
+        if (r < 0 || (r = ro_guard(from)) < 0) return r;
         char to[PATH_MAX];
         r = host_path((long) (int) x[2], (const char*) x[3], 0, to);
-        if (r < 0) return r;
+        if (r < 0 || (r = ro_guard(to)) < 0) return r;
         /* A faked hard link replaced: one link less. */
         if ((r = l2s_unlinked(to)) < 0) return r;
         /* renaming a directory or a symlink, or exchanging anything, changes what paths resolve to */
@@ -1680,9 +1720,11 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_fchownat: return do_chown(dirfd, path, (long) x[2], (long) x[3], (long) x[4]);
     case NR_fchown: return do_chown(x[0], "", (long) x[1], (long) x[2], AT_EMPTY_PATH);
     case NR_utimensat:
-        if (path == 0) return sys(NR_utimensat, x[0], 0, x[2], x[3]);
-        if (empty(path) && (x[3] & AT_EMPTY_PATH)) return sys(NR_utimensat, x[0], path, x[2], x[3]);
-        ON_HOST(!(x[3] & AT_SYMLINK_NOFOLLOW), sys(NR_utimensat, AT_FDCWD, host, x[2], x[3]));
+        if (path == 0 || (empty(path) && (x[3] & AT_EMPTY_PATH))) {
+            if (read_only_fd((long) x[0])) return -EROFS;
+            return sys(NR_utimensat, x[0], path, x[2], x[3]);
+        }
+        ON_HOST_RO(!(x[3] & AT_SYMLINK_NOFOLLOW), ro_guard(host), sys(NR_utimensat, AT_FDCWD, host, x[2], x[3]));
     case NR_statfs:
     case NR_fstatfs: return do_statfs(nr, x);
     case NR_truncate:
@@ -1700,12 +1742,14 @@ static long emulate(long nr, const uint64_t* x) {
         dirfd = AT_FDCWD;
         path = (const char*) x[0];
         if (nr == NR_listxattr || nr == NR_llistxattr) ON_HOST(follow, list_xattr(nr, (long) host, (char*) x[1], (long) x[2]));
-        ON_HOST(follow, sys6(nr, (long) host, (long) x[1], (long) x[2], (long) x[3], (long) x[4], 0));
+        int changes = nr == NR_truncate || nr == NR_setxattr || nr == NR_lsetxattr || nr == NR_removexattr || nr == NR_lremovexattr;
+        ON_HOST_RO(follow, changes ? ro_guard(host) : 0, sys6(nr, (long) host, (long) x[1], (long) x[2], (long) x[3], (long) x[4], 0));
     }
     case NR_fgetxattr:
     case NR_fsetxattr:
     case NR_fremovexattr:
         if (x[1] && same((const char*) x[1], OWN_XATTR)) return nr == NR_fgetxattr ? -ENODATA : -EPERM;
+        if (nr != NR_fgetxattr && read_only_fd((long) x[0])) return -EROFS;
         return sys6(nr, (long) x[0], (long) x[1], (long) x[2], (long) x[3], (long) x[4], 0);
     case NR_flistxattr: {
         return list_xattr(nr, (long) x[0], (char*) x[1], (long) x[2]);
@@ -1726,6 +1770,7 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_getpeername: return do_sockname(nr, (long) x[0], (char*) x[1], (uint32_t*) x[2]);
     case NR_getsockopt: return do_peercred(x);
     case NR_ioctl: return do_drm_version(x);
+    case NR_socket: return do_uevent_socket(x);
     case NR_shmget:
     case NR_shmctl:
     case NR_shmat:

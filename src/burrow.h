@@ -64,7 +64,7 @@ enum {
 enum {
     EPERM = 1, ENODATA = 61, EOPNOTSUPP = 95, ENOENT = 2, ESRCH = 3, EINTR = 4, EIO = 5, E2BIG = 7, ENOEXEC = 8, EBADF = 9, ENOMEM = 12, EACCES = 13,
     EFAULT = 14, EXDEV = 18, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, EMFILE = 24, ERANGE = 34, ENAMETOOLONG = 36, ENOSYS = 38,
-    ELOOP = 40,
+    ELOOP = 40, EROFS = 30,
 };
 
 #define AT_FDCWD (-100)
@@ -73,6 +73,7 @@ enum {
 #define AT_EMPTY_PATH 0x1000
 #define O_RDONLY 0
 #define O_CREAT 0100
+#define O_TRUNC 01000
 #define O_EXCL 0200
 #define O_DIRECTORY 040000
 #define O_NOFOLLOW 0100000
@@ -182,6 +183,7 @@ struct bind {
     char host[512];
     long guest_length, host_length;
     int walked;
+    int readonly; /* -B: writes, creates, renames and unlinks below it fail with EROFS */
 };
 
 enum { RUID, EUID, SUID, FSUID, RGID, EGID, SGID, FSGID, ID_COUNT };
@@ -271,6 +273,11 @@ void record_shared_root(void);
 long take_shared_root(long pid, char* root, long size);
 /* Whether the guest sees the host path @host (in the root or a binding). */
 int guest_sees(const char* host);
+/* Whether the host path @host lies in a read-only binding (-B). */
+int read_only_host(const char* host);
+int read_only_fd(long fd);
+/* -EROFS when @host lies in a read-only binding, else 0. */
+long ro_guard(const char* host);
 /* host_path() for a call that creates nothing, in one walk when it can: *@fd
  * is then the file, opened O_PATH (to be closed), else -1 and @host is to be
  * used. ENOENT is final: no directory is checked for a file to create. */

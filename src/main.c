@@ -24,7 +24,7 @@ static void remove_env(char** envp, long index) {
     memmove(envp + index, envp + index + 1, (char*) end - (char*) (envp + index + 1));
 }
 
-static void add_bind(const char* spec) {
+static void add_bind(const char* spec, int readonly) {
     if (cfg.bind_count == MAX_BINDS) die("too many bindings", 0);
     struct bind* b = &cfg.binds[cfg.bind_count++];
     long colon = 0;
@@ -46,6 +46,7 @@ static void add_bind(const char* spec) {
     if (slash + g >= (long) sizeof(b->guest)) die("binding too long: ", spec);
     memcpy(b->guest + slash, guest, g);
     b->guest[slash + g] = 0;
+    b->readonly = readonly;
     b->host_length = length_of(b->host);
     b->guest_length = length_of(b->guest);
     /* "/dev/" and "/dev" are the same binding. */
@@ -188,7 +189,8 @@ static void launch(long argc, char** argv, char** envp) {
         if (a[0] != '-') break;
         if (i + 1 >= argc) die("missing value for ", a);
         if (same(a, "-r")) root = argv[++i];
-        else if (same(a, "-b")) add_bind(argv[++i]);
+        else if (same(a, "-b")) add_bind(argv[++i], 0);
+        else if (same(a, "-B")) add_bind(argv[++i], 1);
         else if (same(a, "-w")) workdir = argv[++i];
         else if (same(a, "-d")) {
             const char* p = argv[++i];
@@ -206,7 +208,7 @@ static void launch(long argc, char** argv, char** envp) {
         }
         else die("unknown option ", a);
     }
-    if (root == 0 || i >= argc) die("usage: burrow -r ROOTFS [-b HOST[:GUEST]]... [-w DIR] [-d DNS_PORT] [-s STATS_FILE] [-g PATHGEN_FILE] PROGRAM [ARG]...", 0);
+    if (root == 0 || i >= argc) die("usage: burrow -r ROOTFS [-b HOST[:GUEST]]... [-B HOST[:GUEST]]... [-w DIR] [-d DNS_PORT] [-s STATS_FILE] [-g PATHGEN_FILE] PROGRAM [ARG]...", 0);
 
     long fd = sys(NR_openat, AT_FDCWD, root, O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
     if (fd < 0 || (cfg.root_length = fd_path(fd, cfg.root, sizeof(cfg.root))) <= 1) die("cannot open the rootfs ", root);
