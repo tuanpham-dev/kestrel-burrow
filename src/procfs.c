@@ -277,6 +277,23 @@ static void fill(int which, struct text* t) {
     case 13:
         put(t, "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevpts\nnodev\tfuse\n\text4\n\tf2fs\n\tvfat\n");
         break;
+    case 16: /* cgroups: Android refuses it to apps (System Monitor aborts on the error) */
+        put(t, "#subsys_name\thierarchy\tnum_cgroups\tenabled\n"
+               "cpuset\t4\t1\t1\ncpu\t2\t1\t1\ncpuacct\t3\t1\t1\nblkio\t1\t1\t1\n"
+               "memory\t5\t1\t1\nfreezer\t6\t1\t1\n");
+        break;
+    case 17: /* vmstat: libgtop's swap reading stops the program without it; no paging seen */
+        put(t, "pgpgin 0\npgpgout 0\npswpin 0\npswpout 0\n");
+        break;
+    case 18: /* diskstats, partitions: no disks to show */
+        break;
+    case 19:
+        put(t, "major minor  #blocks  name\n\n");
+        break;
+    case 20: /* net/dev: the headings only */
+        put(t, "Inter-|   Receive                                                |  Transmit\n"
+               " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+        break;
     case 14: /* sys/kernel/overflowuid: bwrap maps it in its user namespaces */
     case 15: put(t, "65534\n"); break; /* sys/kernel/overflowgid */
     }
@@ -287,6 +304,7 @@ static const char* const files[] = {
     "/proc/stat", "/proc/sys/kernel/cap_last_cap", "/proc/sys/kernel/pid_max", "/proc/sys/fs/inotify/max_user_watches",
     "/proc/sys/fs/file-max", "/proc/sys/vm/overcommit_memory", "/proc/sys/kernel/shmmax", "/proc/swaps",
     "/proc/filesystems", "/proc/sys/kernel/overflowuid", "/proc/sys/kernel/overflowgid",
+    "/proc/cgroups", "/proc/vmstat", "/proc/diskstats", "/proc/partitions", "/proc/net/dev",
 };
 
 int proc_file(const char* host) {

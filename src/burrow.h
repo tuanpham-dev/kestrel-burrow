@@ -38,6 +38,8 @@
 /* SECCOMP_RET_DATA of Burrow's filter, seen as si_errno: tells our traps
  * from those of the guest's own filters and of Android's. */
 #define TRAP_DATA 0x0b07
+/* SECCOMP_RET_DATA of Burrow's answer to a probe (an errno nobody uses): the guest's filters did not deny the call. */
+#define PROBE_ERRNO 0x0b09
 
 /* -- Kernel interface (arm64, asm-generic) ------------------------------------ */
 
@@ -209,6 +211,7 @@ struct config {
     char ipc[512];           /* SysV IPC's directory, a host path: in the first root, which chroot() keeps */
     int fs_child;            /* a child sharing the root (clone(CLONE_FS)) whose chroot() is still to come, else 0 */
     char hostname[65];       /* the guest's /etc/hostname at launch, uname()'s nodename; empty for the kernel's */
+    int guest_filtered;      /* the guest (this process or one it came from) has installed a seccomp filter; atomic */
     int traced;              /* ptrace(PTRACE_TRACEME) made before the execve(): taken once the program is loaded */
     uint64_t* auxv;          /* the guest's auxiliary vector, on its stack once loaded; else 0 */
 };
@@ -227,6 +230,21 @@ static inline long sys6(long n, long a, long b, long c, long d, long e, long f) 
     register long x5 __asm__("x5") = f;
     register long x8 __asm__("x8") = n;
     __asm__ volatile("bl burrow_gadget"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
+                     : "x30", "memory", "cc");
+    return x0;
+}
+/* A guest's call made again from the probe: see guest_verdict(). */
+static inline long probe6(long n, const uint64_t* x) {
+    register long x0 __asm__("x0") = (long) x[0];
+    register long x1 __asm__("x1") = (long) x[1];
+    register long x2 __asm__("x2") = (long) x[2];
+    register long x3 __asm__("x3") = (long) x[3];
+    register long x4 __asm__("x4") = (long) x[4];
+    register long x5 __asm__("x5") = (long) x[5];
+    register long x8 __asm__("x8") = n;
+    __asm__ volatile("bl burrow_probe"
                      : "+r"(x0)
                      : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
                      : "x30", "memory", "cc");

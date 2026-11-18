@@ -13,7 +13,7 @@
 
 #include "burrow.h"
 
-extern char burrow_gadget[], burrow_sigreturn[];
+extern char burrow_gadget[], burrow_probe[], burrow_sigreturn[];
 
 /* -- The filter --------------------------------------------------------------------- */
 
@@ -43,6 +43,11 @@ struct sock_filter {
     uint32_t k;
 };
 
+struct sock_fprog {
+    unsigned short len;
+    struct sock_filter* filter;
+};
+
 #define LD_ABS 0x20 /* BPF_LD | BPF_W | BPF_ABS */
 #define JEQ 0x15    /* BPF_JMP | BPF_JEQ | BPF_K */
 #define JSET 0x45   /* BPF_JMP | BPF_JSET | BPF_K */
@@ -52,6 +57,12 @@ struct sock_filter {
 #define RET_ERRNO 0x00050000u
 #define AUDIT_ARCH_AARCH64 0xc00000b7u
 #define DRM_IOCTL_VERSION 0xc0406400u
+#define TCGETS2 0x802c542au /* the termios2 ioctls glibc 2.42 uses for tcgetattr()/tcsetattr() */
+#define TCSETS2 0x402c542bu
+#define TCSETSW2 0x402c542cu
+#define TCSETSF2 0x402c542du
+#define PR_SET_SECCOMP 22
+#define SECCOMP_SET_MODE_FILTER 1
 #define EXEC_STACK 0x01000007u /* PROT_READ | PROT_WRITE | PROT_EXEC | PROT_GROWSDOWN */
 #define N_TRAPPED (sizeof(trapped) / sizeof(*trapped))
 #define TO_TRAP 0xff /* a jump to the trap, its distance set once the trap is placed */
@@ -61,16 +72,21 @@ struct sock_filter {
  * 5.11), and it runs no filter at all for those syscalls, Android's neither. */
 long install_filter(void) {
     uint64_t gadget = (uint64_t) burrow_gadget;
-    struct sock_filter f[N_TRAPPED + 80];
+    struct sock_filter f[N_TRAPPED + 100];
     int i = 0;
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 4}; /* arch */
     f[i++] = (struct sock_filter){JEQ, 1, 0, AUDIT_ARCH_AARCH64};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 0}; /* nr */
-    /* ioctl(DRM_IOCTL_VERSION) only: the render node is KGSL, see do_drm_version(). */
-    f[i++] = (struct sock_filter){JEQ, 0, 3, NR_ioctl};
+    /* ioctl(DRM_IOCTL_VERSION) only: the render node is KGSL, see do_drm_version(). The termios2
+     * requests too, see do_termios2(). */
+    f[i++] = (struct sock_filter){JEQ, 0, 7, NR_ioctl};
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 24}; /* args[1], low half */
     f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, DRM_IOCTL_VERSION};
+    f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, TCGETS2};
+    f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, TCSETS2};
+    f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, TCSETSW2};
+    f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, TCSETSF2};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
     /* lseek(fd, 0, SEEK_SET) only: made-up /proc files read again (proc_rewind()). */
     f[i++] = (struct sock_filter){JEQ, 0, 5, NR_lseek};
@@ -114,10 +130,15 @@ long install_filter(void) {
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
     /* prctl(PR_SET_KEEPCAPS) succeeds: Android locks the bit (ping keeps
      * capabilities across setuid()), and the guest's capabilities are fake. */
-    f[i++] = (struct sock_filter){JEQ, 0, 4, NR_prctl};
+    f[i++] = (struct sock_filter){JEQ, 0, 5, NR_prctl};
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 16}; /* args[0], low half */
     f[i++] = (struct sock_filter){JEQ, 0, 1, PR_SET_KEEPCAPS};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ERRNO | 0};
+    f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, PR_SET_SECCOMP}; /* the guest's own filter, see do_guest_filter() */
+    f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
+    f[i++] = (struct sock_filter){JEQ, 0, 3, NR_seccomp};
+    f[i++] = (struct sock_filter){LD_ABS, 0, 0, 16}; /* args[0], low half */
+    f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, SECCOMP_SET_MODE_FILTER};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
     /* recvfrom() traps only with an address (the DNS proxy's answers): recv()
      * passes (Firefox's and curl's network, PipeWire). */
@@ -136,15 +157,19 @@ long install_filter(void) {
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
     for (unsigned t = 0; t < N_TRAPPED; t++) f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, trapped[t]};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
-    /* The trap, unless the call comes from Burrow's gadget. */
+    /* The trap, unless the call comes from Burrow's gadget (allowed) or its probe (an errno of ours). */
+    uint64_t probe = (uint64_t) burrow_probe;
     int trap = i;
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 12}; /* instruction pointer, high half */
-    f[i++] = (struct sock_filter){JEQ, 0, 3, (uint32_t) (gadget >> 32)};
+    f[i++] = (struct sock_filter){JEQ, 0, 7, (uint32_t) (gadget >> 32)};
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 8};
-    f[i++] = (struct sock_filter){JEQ, 2, 0, (uint32_t) gadget + 4};
-    f[i++] = (struct sock_filter){JEQ, 1, 0, (uint32_t) gadget};
-    f[i++] = (struct sock_filter){RET, 0, 0, RET_TRAP | TRAP_DATA};
+    f[i++] = (struct sock_filter){JEQ, 4, 0, (uint32_t) gadget + 4};
+    f[i++] = (struct sock_filter){JEQ, 3, 0, (uint32_t) gadget};
+    f[i++] = (struct sock_filter){JEQ, 1, 0, (uint32_t) probe + 4};
+    f[i++] = (struct sock_filter){JEQ, 0, 2, (uint32_t) probe};
+    f[i++] = (struct sock_filter){RET, 0, 0, RET_ERRNO | PROBE_ERRNO};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
+    f[i++] = (struct sock_filter){RET, 0, 0, RET_TRAP | TRAP_DATA};
     for (int j = 0; j < trap; j++)
         if ((f[j].code == JEQ || f[j].code == JSET) && f[j].jt == TO_TRAP) f[j].jt = (uint8_t) (trap - j - 1);
     struct {
@@ -154,6 +179,93 @@ long install_filter(void) {
     long r = sys(NR_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0);
     if (r < 0) return r;
     return sys(NR_seccomp, 1 /* SECCOMP_SET_MODE_FILTER */, 0, &prog, 0);
+}
+
+/* The guest's own filters (Chromium's sandbox, Firefox's) are checked for every call of ours, too: the
+ * gadget's internal calls (the path walk's lstat and openat2, the owner store's xattrs) were trapped or
+ * killed by them, and the guest's call failed with ENOSYS (every Chromium renderer died of it). Each
+ * filter the guest installs gets a prologue that lets the gadget through for the calls Burrow makes for
+ * itself, own[] below, and goes on with its own program for everything else; its traps for the guest's
+ * own calls still reach the guest's handler, since those come from the guest's code.
+ * What is left open (runtime/DELTA.md): a guest that jumps to the gadget itself passes its own filter
+ * for the numbers in own[]; and a filter of more than BPF_MAXINSNS - PROLOGUE instructions gets no
+ * prologue, so its verdicts reach Burrow's own calls too. The calls that forward the guest's own
+ * (connect, bind, socket, sendto, sendmsg, execve, execveat, mount, unshare, clone, kill, ptrace, the ids and
+ * the SysV calls) are not in the list: the probe has asked the guest's filters about the call itself, and
+ * the forwarded one is judged by them again. */
+static const uint16_t own[] = {
+    /* the path walk, the owner store, the made-up /proc files, the SysV IPC files, the loader */
+    NR_openat, NR_openat2, NR_newfstatat, NR_fstat, NR_statx, NR_readlinkat, NR_getdents64, NR_faccessat,
+    NR_close, NR_read, NR_write, NR_pread64, 68 /* pwrite64 */, NR_lseek, NR_fcntl, 46 /* ftruncate */, 279 /* memfd_create */,
+    NR_mmap, NR_munmap, NR_mprotect, NR_mkdirat, NR_symlinkat, NR_unlinkat, NR_renameat, NR_renameat2,
+    NR_getxattr, NR_lgetxattr, NR_fgetxattr, NR_setxattr, NR_lsetxattr, NR_fsetxattr,
+    /* the handler itself */
+    NR_rt_sigaction, NR_rt_sigprocmask, NR_rt_sigreturn, NR_sigaltstack, 98 /* futex */, NR_getpid, NR_gettid,
+    NR_tgkill, 113 /* clock_gettime */, 278 /* getrandom */, 123 /* sched_getaffinity */, 179 /* sysinfo */, NR_uname, NR_prctl,
+    NR_process_vm_readv, NR_exit_group,
+};
+#define N_OWN (sizeof(own) / sizeof(*own))
+#define PROLOGUE (N_OWN + 8)
+#define BPF_JA 0x05
+#define BPF_MAXINSNS 4096
+
+static void gadget_prologue(struct sock_filter* f) {
+    uint64_t gadget = (uint64_t) burrow_gadget;
+    unsigned end = PROLOGUE;  /* the guest's program */
+    unsigned allow = end - 1; /* RET_ALLOW */
+    f[0] = (struct sock_filter){LD_ABS, 0, 0, 12}; /* instruction pointer, high half */
+    f[1] = (struct sock_filter){JEQ, 0, (uint8_t) (end - 2), (uint32_t) (gadget >> 32)};
+    f[2] = (struct sock_filter){LD_ABS, 0, 0, 8};
+    f[3] = (struct sock_filter){JEQ, 1, 0, (uint32_t) gadget + 4};
+    f[4] = (struct sock_filter){JEQ, 0, (uint8_t) (end - 5), (uint32_t) gadget};
+    f[5] = (struct sock_filter){LD_ABS, 0, 0, 0}; /* nr */
+    for (unsigned i = 0; i < N_OWN; i++)
+        f[6 + i] = (struct sock_filter){JEQ, (uint8_t) (allow - (6 + i) - 1), 0, own[i]};
+    f[6 + N_OWN] = (struct sock_filter){BPF_JA, 0, 0, end - (6 + N_OWN) - 1};
+    f[allow] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
+}
+
+static void* map(long size);
+
+/* The guest's memory, copied without a fault in the handler: -EFAULT if it is not all there. */
+static long guest_read(void* to, const void* from, long size) {
+    struct {
+        void* base;
+        size_t length;
+    } local = {to, (size_t) size}, remote = {(void*) from, (size_t) size};
+    long r = sys6(NR_process_vm_readv, sys(NR_getpid, 0, 0, 0, 0), (long) &local, 1, (long) &remote, 1, 0);
+    return r == size ? 0 : r < 0 ? r : -EFAULT;
+}
+
+/* seccomp(SECCOMP_SET_MODE_FILTER, flags, prog) and prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog). */
+static long do_guest_filter(int nr, const uint64_t* x) {
+    long flags = nr == NR_seccomp ? (long) x[1] : 0;
+    if (nr == NR_prctl && x[1] != 2 /* SECCOMP_MODE_FILTER */) return sys(NR_prctl, x[0], x[1], x[2], x[3]);
+    struct sock_fprog prog;
+    long r = x[2] == 0 ? -EFAULT : guest_read(&prog, (const void*) x[2], sizeof(prog));
+    if (r < 0) return r;
+    if (prog.len == 0 || prog.len > BPF_MAXINSNS) return -EINVAL;
+    if (prog.filter == 0) return -EFAULT;
+    if (prog.len > BPF_MAXINSNS - PROLOGUE) {
+        /* no room for the prologue: the guest's filter as it is */
+        r = nr == NR_seccomp ? sys(NR_seccomp, x[0], x[1], x[2], 0) : sys(NR_prctl, x[0], x[1], x[2], x[3]);
+    } else {
+        long size = (long) (prog.len + PROLOGUE) * (long) sizeof(struct sock_filter);
+        struct sock_filter* f = (struct sock_filter*) map(size);
+        if (f == 0) return -ENOMEM;
+        gadget_prologue(f);
+        r = guest_read(f + PROLOGUE, prog.filter, (long) prog.len * (long) sizeof(struct sock_filter));
+        if (r == 0) {
+            struct sock_fprog ours = {(unsigned short) (prog.len + PROLOGUE), f};
+            r = nr == NR_seccomp ? sys(NR_seccomp, SECCOMP_SET_MODE_FILTER, flags, &ours, 0)
+                                 : sys(NR_prctl, PR_SET_SECCOMP, 2, &ours, 0);
+        }
+        sys(NR_munmap, f, size, 0, 0);
+    }
+    /* installed: 0, or the listener's descriptor (a positive result with TSYNC is the thread that failed) */
+    if (r == 0 || (r > 0 && (flags & 8 /* NEW_LISTENER */) && !(flags & 1 /* TSYNC */)))
+        __atomic_store_n(&cfg.guest_filtered, 1, __ATOMIC_RELAXED);
+    return r;
 }
 
 /* -- Ids (proot's fake_id0) ------------------------------------------------------------ */
@@ -258,8 +370,15 @@ static long do_sigprocmask(uint64_t* mask, long how, const uint64_t* set, uint64
 
 /* A SIGSYS that is not ours: the guest's own filters (Firefox's sandbox),
  * Android's, or a kill(). */
+
 static void foreign(int sig, struct ksiginfo* info, struct kucontext* uc) {
     uintptr_t h = guest_sigsys.handler;
+    if (info->code == SYS_SECCOMP && info->errno_ == 0 && info->call_addr == (uintptr_t) burrow_probe + 4) {
+        /* Android's own trap on the probed call (a bare SECCOMP_RET_TRAP outranks our errno): not the guest's
+         * verdict. Nothing of the guest's filters denied it, so it goes on to the emulation. */
+        uc->mcontext.regs[0] = (uint64_t) -PROBE_ERRNO;
+        return;
+    }
     if (info->code == SYS_SECCOMP && info->call_addr == (uintptr_t) burrow_gadget + 4) {
         /* Burrow's own call, which the guest's filter traps (Chromium's
          * sandboxed processes trap openat2): it fails, as if missing,
@@ -983,7 +1102,10 @@ static long do_uevent_socket(const uint64_t* x) {
  * ioctl, and Chromium's GPU process dies without a version. KGSL answers as
  * "kgsl": Mesa's loader is told its driver (zink), Turnip's msm probe skips
  * any name but "msm". */
+static long do_termios2(const uint64_t* x);
+
 static long do_drm_version(const uint64_t* x) {
+    if ((uint32_t) x[1] != DRM_IOCTL_VERSION) return do_termios2(x);
     long r = sys(NR_ioctl, x[0], x[1], x[2], 0);
     if (r != -25 /* ENOTTY */ && r != -EINVAL) return r;
     char target[32];
@@ -1009,6 +1131,47 @@ static long do_drm_version(const uint64_t* x) {
         *lengths[i] = length;
     }
     return 0;
+}
+
+/* TCGETS2 and the TCSETS2 family: Android's SELinux policy allows the termios ioctls of a terminal
+ * but not these (EACCES), and glibc 2.42's tcgetattr() and isatty() use them with no fallback: bash
+ * took the terminal for a file and showed no prompt (Ubuntu 26.04, Fedora 45, Arch). Tried as they
+ * are first; on EACCES they are made with TCGETS/TCSETS, whose struct is termios2 without the speeds. */
+struct ktermios {
+    uint32_t iflag, oflag, cflag, lflag;
+    uint8_t line, cc[19];
+};
+struct ktermios2 {
+    struct ktermios t;
+    uint32_t ispeed, ospeed;
+};
+
+static uint32_t baud_of(uint32_t cflag) {
+    static const uint32_t rate[] = {0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400};
+    static const uint32_t high[] = {57600, 115200, 230400, 460800, 500000, 576000, 921600, 1000000,
+                                    1152000, 1500000, 2000000, 2500000, 3000000, 3500000, 4000000};
+    uint32_t b = cflag & 0x100f; /* CBAUD */
+    if (b < 16) return rate[b];
+    if (b >= 0x1001 && b <= 0x100f) return high[b - 0x1001];
+    return 38400;
+}
+
+static long do_termios2(const uint64_t* x) {
+    uint32_t cmd = (uint32_t) x[1];
+    long r = sys(NR_ioctl, x[0], x[1], x[2], 0);
+    if (r != -EACCES || x[2] == 0) return r;
+    struct ktermios2* t2 = (struct ktermios2*) x[2];
+    if (cmd == TCGETS2) {
+        struct ktermios t;
+        r = sys(NR_ioctl, x[0], 0x5401 /* TCGETS */, &t, 0);
+        if (r < 0) return r;
+        t2->t = t;
+        t2->ispeed = t2->ospeed = baud_of(t.cflag);
+        return 0;
+    }
+    struct ktermios t = t2->t;
+    if ((t.cflag & 0x100f) == 0x1000 /* BOTHER */) t.cflag = (t.cflag & ~0x100fu) | 15; /* B38400 */
+    return sys(NR_ioctl, x[0], cmd == TCSETS2 ? 0x5402 : cmd == TCSETSW2 ? 0x5403 : 0x5404, &t, 0);
 }
 
 /* -- execve ------------------------------------------------------------------------------ */
@@ -1608,6 +1771,8 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_umount2: return do_umount((const char*) x[0]);
     case NR_unshare: return do_unshare((long) x[0]);
     case NR_ptrace: return do_traceme();
+    case NR_seccomp:
+    case NR_prctl: return do_guest_filter(nr, x);
     case NR_mprotect: return do_mprotect(x);
     case NR_mkdirat: {
         char host[PATH_MAX];
@@ -1928,6 +2093,18 @@ static void count(const struct ksiginfo* info, uint64_t* sums, uint64_t start) {
 static void on_trap(struct ksiginfo* info, struct kucontext* uc) {
     uint64_t* x = uc->mcontext.regs;
     if (cfg.fs_child != 0) take_child_root();
+    /* A guest filter that denies this call (ERRNO) is obeyed before anything is emulated: Chromium's sandbox
+     * checks that fchmod(-1, 07777) fails as its policy says, and a renderer that sees another errno aborts.
+     * The call is repeated from the probe, which our filter answers with an errno of its own: what comes back is
+     * then the guest's filters' verdict, or ours (PROBE_ERRNO) if they allow the call. Their traps never get
+     * here (they are the guest's own, see foreign()), and a kill does not return. */
+    if (__atomic_load_n(&cfg.guest_filtered, __ATOMIC_RELAXED)) {
+        long v = probe6(info->syscall, x);
+        if (v != -PROBE_ERRNO) {
+            x[0] = (uint64_t) v;
+            return;
+        }
+    }
     if (info->syscall == NR_clone) {
         x[0] = (uint64_t) do_clone(uc);
         return;

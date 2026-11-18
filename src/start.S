@@ -19,6 +19,16 @@ burrow_gadget:
     svc #0
     ret
 
+// The probe: the guest's own call, repeated here to learn what the guest's seccomp filters make of it (see
+// guest_verdict()). Burrow's filter answers it with an errno of its own, so that the call is never made:
+// the result is the guest's filter's, if it denies the call, else Burrow's.
+    .balign 16
+    .globl burrow_probe
+    .type burrow_probe, %function
+burrow_probe:
+    svc #0
+    ret
+
 // The SIGSYS handler's restorer: its rt_sigreturn goes through the gadget, the guests' are trapped.
     .globl burrow_sigreturn
     .type burrow_sigreturn, %function
