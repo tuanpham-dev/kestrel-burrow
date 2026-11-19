@@ -63,7 +63,6 @@ struct sock_fprog {
 #define TCSETSF2 0x402c542du
 #define PR_SET_SECCOMP 22
 #define SECCOMP_SET_MODE_FILTER 1
-#define EXEC_STACK 0x01000007u /* PROT_READ | PROT_WRITE | PROT_EXEC | PROT_GROWSDOWN */
 #define N_TRAPPED (sizeof(trapped) / sizeof(*trapped))
 #define TO_TRAP 0xff /* a jump to the trap, its distance set once the trap is placed */
 
@@ -95,10 +94,15 @@ long install_filter(void) {
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 32}; /* args[2], low half */
     f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, 0 /* SEEK_SET */};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
-    /* mprotect() of an executable stack only, see do_mprotect(). */
+    /* mprotect() asking for PROT_EXEC or PROT_BTI only, see do_mprotect(). */
     f[i++] = (struct sock_filter){JEQ, 0, 3, NR_mprotect};
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 32}; /* args[2], low half */
-    f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, EXEC_STACK};
+    f[i++] = (struct sock_filter){JSET, TO_TRAP, 0, PROT_EXEC | PROT_BTI};
+    f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
+    /* mmap() asking for PROT_BTI only (glibc 2.40 and later maps libraries so), see NR_mmap in the handler. */
+    f[i++] = (struct sock_filter){JEQ, 0, 3, NR_mmap};
+    f[i++] = (struct sock_filter){LD_ABS, 0, 0, 32}; /* args[2], low half */
+    f[i++] = (struct sock_filter){JSET, TO_TRAP, 0, PROT_BTI};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
     /* getsockopt(), only for SO_PEERCRED: the ids it reports are real. */
     f[i++] = (struct sock_filter){JEQ, 0, 3, NR_getsockopt};
@@ -197,7 +201,7 @@ static const uint16_t own[] = {
     /* the path walk, the owner store, the made-up /proc files, the SysV IPC files, the loader */
     NR_openat, NR_openat2, NR_newfstatat, NR_fstat, NR_statx, NR_readlinkat, NR_getdents64, NR_faccessat,
     NR_close, NR_read, NR_write, NR_pread64, 68 /* pwrite64 */, NR_lseek, NR_fcntl, 46 /* ftruncate */, 279 /* memfd_create */,
-    NR_mmap, NR_munmap, NR_mprotect, NR_mkdirat, NR_symlinkat, NR_unlinkat, NR_renameat, NR_renameat2,
+    NR_mmap, NR_munmap, NR_mprotect, NR_mremap, NR_mkdirat, NR_symlinkat, NR_unlinkat, NR_renameat, NR_renameat2,
     NR_getxattr, NR_lgetxattr, NR_fgetxattr, NR_setxattr, NR_lsetxattr, NR_fsetxattr,
     /* the handler itself */
     NR_rt_sigaction, NR_rt_sigprocmask, NR_rt_sigreturn, NR_sigaltstack, 98 /* futex */, NR_getpid, NR_gettid,
@@ -1221,6 +1225,19 @@ static int shebang(char* head, long n, char** interpreter, char** argument) {
     return **interpreter != 0;
 }
 
+/* Whether a program is Wine's: its loaders and server by base name, or anything below a wine/
+ * directory (/usr/lib/wine/wine64, a Hangover or a /opt/wine tree). Wine's own entry points
+ * (__wine_syscall_dispatcher) have no BTI landing pad, so such a process gets no PROT_BTI, see do_mprotect(). */
+static int wine_program(const char* path) {
+    const char* b = path;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/' && p[1]) b = p + 1;
+        if (starts_with(p, "/wine/")) return 1;
+    }
+    return same(b, "wine") || same(b, "wine64") || same(b, "wine-preloader") || same(b, "wine64-preloader") ||
+           same(b, "wineserver") || same(b, "wineserver32") || same(b, "wineserver64");
+}
+
 long emulate_execve(long dirfd, const char* path, char* const* argv, char* const* envp, long flags) {
     char guest[PATH_MAX], host[PATH_MAX], resolved[PATH_MAX];
     char heads[4][256];
@@ -1322,7 +1339,14 @@ long emulate_execve(long dirfd, const char* path, char* const* argv, char* const
     if (set_ids_mode & S_ISUID) set_id(EUID, set_uid_to), set_id(SUID, set_uid_to), set_id(FSUID, set_uid_to);
     if (set_ids_mode & S_ISGID) set_id(EGID, set_gid_to), set_id(SGID, set_gid_to), set_id(FSGID, set_gid_to);
     cfg.traced = traceme_tid != 0 && traceme_tid == sys(NR_gettid, 0, 0, 0, 0);
+    /* Without PROT_BTI: Wine's programs, and any program started with BURROW_NO_BTI=1 in its environment.
+     * Not inherited by what Wine starts, only by a fork() without execve(). */
+    int old_no_bti = __atomic_load_n(&cfg.no_bti, __ATOMIC_RELAXED);
+    int no_bti = wine_program(resolved) || wine_program(guest);
+    for (long i = 0; i < envc && !no_bti; i++) no_bti = same(envp[i], "BURROW_NO_BTI=1");
+    __atomic_store_n(&cfg.no_bti, no_bti, __ATOMIC_RELAXED);
     r = encode_config(state + 7, state_size - 7, resolved, host, name);
+    __atomic_store_n(&cfg.no_bti, old_no_bti, __ATOMIC_RELAXED);
     cfg.traced = 0;
     for (int i = 0; i < ID_COUNT; i++) set_id(i, old_ids[i]);
     if (r < 0) {
@@ -1612,12 +1636,38 @@ static long do_umount(const char* target) {
     return 0;
 }
 
-/* mprotect() making the stack executable, as ld.so does for a library that
- * asks for it (PT_GNU_STACK): Android refuses it to apps, and the program
- * would stop before main. The stack stays as it is. */
+/* mprotect() asking for PROT_EXEC or PROT_BTI.
+ * - PROT_BTI (ld.so sets it on every library with the BTI note, which Debian and Ubuntu build with;
+ *   glibc 2.40 and later in mmap(), earlier in mprotect())
+ *   is dropped in Wine's processes only (cfg.no_bti, set at execve): the CPU raises SIGILL for a jump to code with no landing pad, and Wine's own
+ *   entry points (__wine_syscall_dispatcher, __wine_unix_call_dispatcher in ntdll.so) have none, so
+ *   wineboot dies in an exception loop on the first system call. The libraries lose BTI's
+ *   hardening, as on a CPU without it.
+ * Android refuses two kinds of PROT_EXEC to apps (EACCES, SELinux):
+ * - the executable stack ld.so asks for (PT_GNU_STACK) of a library: the program would stop before
+ *   main, the stack stays as it is;
+ * - execute on pages of a private file mapping that were written ("execmod"): Wine maps its PE
+ *   modules from the file, relocates them and then makes the code executable ("map_image_into_view
+ *   failed to set 60000020 protection"). The range gets an anonymous copy of its current content
+ *   that replaces it in one step (mremap), and the copy is given the protection. A shared file
+ *   mapping in the range turns into private memory then. */
 static long do_mprotect(const uint64_t* x) {
-    long r = sys(NR_mprotect, x[0], x[1], x[2], 0);
-    return r == -EACCES ? 0 : r;
+    uint64_t prot = __atomic_load_n(&cfg.no_bti, __ATOMIC_RELAXED) ? x[2] & ~(uint64_t) PROT_BTI : x[2];
+    long r = sys(NR_mprotect, x[0], x[1], prot, 0);
+    if (r != -EACCES) return r;
+    uint64_t addr = x[0], len = (x[1] + 4095) & ~4095ull;
+    if (!(prot & PROT_EXEC)) return r;
+    if ((prot & 0x01000000) || len == 0 || (addr & 4095)) return 0;
+    if ((r = sys(NR_mprotect, addr, len, PROT_READ, 0)) < 0) return r;
+    long tmp = sys6(NR_mmap, 0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tmp < 0 && tmp > -4096) return tmp;
+    memcpy((void*) tmp, (const void*) addr, len);
+    r = sys6(NR_mremap, tmp, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, addr, 0);
+    if (r < 0 && r > -4096) {
+        sys(NR_munmap, tmp, len, 0, 0);
+        return r;
+    }
+    return sys(NR_mprotect, addr, len, prot, 0);
 }
 
 /* chroot(): the directory becomes the rootfs, the bindings below it stay.
@@ -1774,6 +1824,7 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_seccomp:
     case NR_prctl: return do_guest_filter(nr, x);
     case NR_mprotect: return do_mprotect(x);
+    case NR_mmap: return sys6(NR_mmap, x[0], x[1], __atomic_load_n(&cfg.no_bti, __ATOMIC_RELAXED) ? x[2] & ~(uint64_t) PROT_BTI : x[2], x[3], x[4], x[5]);
     case NR_mkdirat: {
         char host[PATH_MAX];
         long r = host_path(dirfd, path, 0, host);

@@ -54,7 +54,7 @@ enum {
     NR_setreuid = 145, NR_setuid = 146, NR_setresuid = 147, NR_getresuid = 148, NR_setresgid = 149,
     NR_capget = 90, NR_capset = 91, NR_getresgid = 150, NR_uname = 160, NR_setfsuid = 151, NR_setfsgid = 152, NR_getgroups = 158, NR_setgroups = 159, NR_umask = 166, NR_prctl = 167, NR_ptrace = 117,
     NR_kill = 129, NR_getpid = 172, NR_getppid = 173, NR_getuid = 174, NR_geteuid = 175, NR_getgid = 176, NR_getegid = 177, NR_gettid = 178,
-    NR_socket = 198, NR_bind = 200, NR_connect = 203, NR_getsockname = 204, NR_getpeername = 205, NR_sendto = 206, NR_recvfrom = 207, NR_getsockopt = 209, NR_sendmsg = 211, NR_munmap = 215, NR_clone = 220, NR_execve = 221, NR_mmap = 222, NR_mprotect = 226,
+    NR_socket = 198, NR_bind = 200, NR_connect = 203, NR_getsockname = 204, NR_getpeername = 205, NR_sendto = 206, NR_recvfrom = 207, NR_getsockopt = 209, NR_sendmsg = 211, NR_munmap = 215, NR_clone = 220, NR_execve = 221, NR_mremap = 216, NR_mmap = 222, NR_mprotect = 226,
     NR_renameat2 = 276, NR_seccomp = 277, NR_execveat = 281, NR_statx = 291, NR_openat2 = 437,
     NR_clone3 = 435, NR_faccessat2 = 439, NR_fchmodat2 = 452, NR_process_vm_readv = 270,
     NR_umount2 = 39, NR_mount = 40, NR_unshare = 97, NR_open_tree = 428, NR_move_mount = 429, NR_fsopen = 430,
@@ -101,9 +101,12 @@ enum {
 #define MAP_SHARED 0x01
 #define O_RDWR 02
 #define PROT_EXEC 4
+#define PROT_BTI 0x10 /* arm64 */
 #define MAP_PRIVATE 0x02
 #define MAP_FIXED 0x10
 #define MAP_ANONYMOUS 0x20
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED 2
 #define MAP_NORESERVE 0x4000
 #define SIGSYS 31
 #define SYS_SECCOMP 1
@@ -212,6 +215,7 @@ struct config {
     int fs_child;            /* a child sharing the root (clone(CLONE_FS)) whose chroot() is still to come, else 0 */
     char hostname[65];       /* the guest's /etc/hostname at launch, uname()'s nodename; empty for the kernel's */
     int guest_filtered;      /* the guest (this process or one it came from) has installed a seccomp filter; atomic */
+    int no_bti;              /* PROT_BTI is dropped from mmap() and mprotect(): Wine's programs (or BURROW_NO_BTI=1); atomic */
     int traced;              /* ptrace(PTRACE_TRACEME) made before the execve(): taken once the program is loaded */
     uint64_t* auxv;          /* the guest's auxiliary vector, on its stack once loaded; else 0 */
 };

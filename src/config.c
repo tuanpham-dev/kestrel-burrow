@@ -58,7 +58,7 @@ long encode_config(char* to, long size, const char* exe, const char* host_exe, c
     at = put(at, end, cfg.ipc);
     at = put_number(at, end, (unsigned long) cfg.fs_child);
     at = put(at, end, cfg.hostname);
-    at = put_number(at, end, (unsigned long) cfg.traced | (unsigned long) __atomic_load_n(&cfg.guest_filtered, __ATOMIC_RELAXED) << 1);
+    at = put_number(at, end, (unsigned long) cfg.traced | (unsigned long) __atomic_load_n(&cfg.guest_filtered, __ATOMIC_RELAXED) << 1 | (unsigned long) __atomic_load_n(&cfg.no_bti, __ATOMIC_RELAXED) << 2);
     at = put_number(at, end, (unsigned long) cfg.group_count);
     for (int i = 0; i < cfg.group_count; i++) at = put_number(at, end, cfg.groups[i]);
     at = put_number(at, end, (unsigned long) cfg.bind_count);
@@ -116,6 +116,7 @@ int decode_config(const char* s) {
     if (!take_number(&s, &v)) return 0;
     cfg.traced = (v & 1) != 0;
     cfg.guest_filtered = (v & 2) != 0;
+    cfg.no_bti = (v & 4) != 0;
     if (!take_number(&s, &v) || v > MAX_GROUPS) return 0;
     cfg.group_count = (int) v;
     for (int i = 0; i < cfg.group_count; i++) {
