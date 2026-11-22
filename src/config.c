@@ -43,7 +43,7 @@ static char* put_number(char* at, char* end, unsigned long value) {
 
 long encode_config(char* to, long size, const char* exe, const char* host_exe, const char* name) {
     char* end = to + size;
-    char* at = put(to, end, "10");
+    char* at = put(to, end, "11");
     at = put(at, end, cfg.root);
     at = put(at, end, cfg.self);
     at = put_number(at, end, cfg.real_uid);
@@ -65,8 +65,10 @@ long encode_config(char* to, long size, const char* exe, const char* host_exe, c
     for (int i = 0; i < cfg.bind_count; i++) {
         at = put(at, end, cfg.binds[i].guest);
         at = put(at, end, cfg.binds[i].host);
-        at = put_number(at, end, (unsigned long) (cfg.binds[i].walked | cfg.binds[i].readonly << 1));
+        at = put_number(at, end, (unsigned long) (cfg.binds[i].walked | cfg.binds[i].readonly << 1 | cfg.binds[i].launch << 2));
     }
+    at = put_number(at, end, (unsigned long) cfg.ro_count);
+    for (int i = 0; i < cfg.ro_count; i++) at = put(at, end, cfg.ro_hosts[i]);
     if (at == 0) return -E2BIG;
     at[-1] = 0;
     return at - 1 - to;
@@ -94,7 +96,7 @@ static int take_number(const char** s, unsigned long* value) {
 int decode_config(const char* s) {
     char version[8];
     unsigned long v;
-    if (!take(&s, version, sizeof(version)) || !same(version, "10")) return 0;
+    if (!take(&s, version, sizeof(version)) || !same(version, "11")) return 0;
     if (!take(&s, cfg.root, sizeof(cfg.root)) || !take(&s, cfg.self, sizeof(cfg.self))) return 0;
     if (!take_number(&s, &v)) return 0;
     cfg.real_uid = (uint32_t) v;
@@ -131,9 +133,14 @@ int decode_config(const char* s) {
             return 0;
         b->walked = (v & 1) != 0;
         b->readonly = (v & 2) != 0;
+        b->launch = (v & 4) != 0;
         b->guest_length = length_of(b->guest);
         b->host_length = length_of(b->host);
     }
+    if (!take_number(&s, &v) || v > 2 * MAX_BINDS) return 0;
+    cfg.ro_count = (int) v;
+    for (int i = 0; i < cfg.ro_count; i++)
+        if (!take(&s, cfg.ro_hosts[i], sizeof(cfg.ro_hosts[i]))) return 0;
     cfg.root_length = length_of(cfg.root);
     set_root_alias();
     return 1;

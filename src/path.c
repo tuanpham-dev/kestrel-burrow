@@ -60,7 +60,7 @@ static int under(const char* s, const char* prefix, long n) {
  * @rest, null when the guest cannot see it. */
 /* @p (@n bytes) under the app data directory's other name (see set_root_alias()) in @out;
  * the length, or -1 when @p is under neither name or does not fit. */
-static long other_name(const char* p, long n, char* out, long size) {
+long other_name(const char* p, long n, char* out, long size) {
     static const char* const pairs[][2] = {{"/data/user/0/", "/data/data/"}, {"/data/data/", "/data/user/0/"}};
     for (unsigned i = 0; i < 2; i++) {
         long from = length_of(pairs[i][0]), to = length_of(pairs[i][1]);
@@ -99,10 +99,23 @@ static const char* guest_part(const char* host, const char** guest) {
     return rest;
 }
 
+/* Whether @host is @dir (@n bytes) or below it, or the same under the data directory's other name. */
+static int under_either(const char* host, const char* dir, long n) {
+    char alias[PATH_MAX];
+    if (under(host, dir, n)) return 1;
+    long a = other_name(dir, n, alias, sizeof(alias));
+    return a > 0 && under(host, alias, a);
+}
+
+/* The launch's read-only folders (cfg.ro_hosts, under both names of the app's data directory, as
+ * fd_path() may give either) stay, whatever the guest does to its bindings; the bindings a guest's
+ * mount() made from them are read-only too. */
 static int under_read_only(const char* host) {
+    for (int i = 0; i < cfg.ro_count; i++)
+        if (under(host, cfg.ro_hosts[i], length_of(cfg.ro_hosts[i]))) return 1;
     for (int i = 0; i < cfg.bind_count; i++) {
         const struct bind* b = &cfg.binds[i];
-        if (b->readonly && under(host, b->host, b->host_length)) return 1;
+        if (b->readonly && under_either(host, b->host, b->host_length)) return 1;
     }
     return 0;
 }
@@ -492,7 +505,7 @@ static long walk(const char* path, int follow, char* host, char* out) {
             if (t < 0) return t;
             target[t] = 0;
             long u = unhost(target, t);
-            if (u == t && l2s_target(target)) {
+            if (u == t && !under_read_only(host) && l2s_target(target)) {
                 /* A faked hard link made under another root (a walked binding
                  * after chroot): its file is a host path, and no directory. */
                 return join(host, target, t, rest + at) < 0 || join(out, out, n, rest + at) < 0 ? -ENAMETOOLONG : 0;
@@ -729,6 +742,8 @@ long open_direct(long dirfd, const char* path, long flags, long mode) {
     uint64_t start = stats_start();
     r = host_of(guest, length_of(guest), host);
     if (r < 0) return r;
+    /* No binding here, but after a chroot() the root may be, or hold, a read-only folder: ro_open() judges it. */
+    if (under_read_only(host)) return -ELOOP;
     struct open_how how = {(uint64_t) flags, flags & O_CREAT ? (uint64_t) mode & 07777 : 0, RESOLVE_NO_SYMLINKS};
     r = open_how_host(host, &how);
     stats_step(STATS_OPEN, start);

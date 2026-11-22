@@ -24,7 +24,7 @@ static void remove_env(char** envp, long index) {
     memmove(envp + index, envp + index + 1, (char*) end - (char*) (envp + index + 1));
 }
 
-static void add_bind(const char* spec, int readonly) {
+static void add_bind(const char* spec, int readonly, int walked) {
     if (cfg.bind_count == MAX_BINDS) die("too many bindings", 0);
     struct bind* b = &cfg.binds[cfg.bind_count++];
     long colon = 0;
@@ -32,11 +32,20 @@ static void add_bind(const char* spec, int readonly) {
     if (colon >= (long) sizeof(b->host)) die("binding too long: ", spec);
     memcpy(b->host, spec, colon);
     b->host[colon] = 0;
-    /* A relative host path is from the launcher's directory: made absolute, without symlinks. */
-    if (b->host[0] != '/') {
+    /* The host path without symlinks (a relative one is from the launcher's directory), as the
+     * kernel names it: the path walk joins it to the guest's rest, and a read-only check compares
+     * it with the paths of descriptors. A host path that is not there yet stays as given. */
+    {
+        char real[sizeof(b->host)];
         long fd = sys(NR_openat, AT_FDCWD, b->host, O_PATH | O_CLOEXEC, 0);
-        if (fd < 0 || fd_path(fd, b->host, sizeof(b->host)) <= 0) die("cannot open the binding ", spec);
-        sys(NR_close, fd, 0, 0, 0);
+        if (fd >= 0) {
+            long n = fd_path(fd, real, sizeof(real));
+            sys(NR_close, fd, 0, 0, 0);
+            if (n > 0 && n < (long) sizeof(real) && real[0] == '/') memcpy(b->host, real, n), b->host[n] = 0;
+            else if (b->host[0] != '/') die("cannot open the binding ", spec);
+        } else if (b->host[0] != '/') {
+            die("cannot open the binding ", spec);
+        }
     }
     /* A relative guest path is from the guest's root. */
     const char* guest = spec[colon] ? spec + colon + 1 : spec;
@@ -47,11 +56,20 @@ static void add_bind(const char* spec, int readonly) {
     memcpy(b->guest + slash, guest, g);
     b->guest[slash + g] = 0;
     b->readonly = readonly;
+    b->walked = walked;
+    b->launch = 1;
     b->host_length = length_of(b->host);
     b->guest_length = length_of(b->guest);
     /* "/dev/" and "/dev" are the same binding. */
     while (b->guest_length > 1 && b->guest[b->guest_length - 1] == '/') b->guest[--b->guest_length] = 0;
     while (b->host_length > 1 && b->host[b->host_length - 1] == '/') b->host[--b->host_length] = 0;
+    if (readonly) {
+        if (cfg.ro_count + 2 > 2 * MAX_BINDS) die("too many bindings", 0);
+        memcpy(cfg.ro_hosts[cfg.ro_count++], b->host, b->host_length + 1);
+        char alias[PATH_MAX];
+        if (other_name(b->host, b->host_length, alias, sizeof(alias)) > 0 && length_of(alias) < (long) sizeof(cfg.ro_hosts[0]))
+            memcpy(cfg.ro_hosts[cfg.ro_count++], alias, length_of(alias) + 1);
+    }
 }
 
 /* The first line of the guest's /etc/hostname, as a boot would set it. */
@@ -189,8 +207,9 @@ static void launch(long argc, char** argv, char** envp) {
         if (a[0] != '-') break;
         if (i + 1 >= argc) die("missing value for ", a);
         if (same(a, "-r")) root = argv[++i];
-        else if (same(a, "-b")) add_bind(argv[++i], 0);
-        else if (same(a, "-B")) add_bind(argv[++i], 1);
+        else if (same(a, "-b")) add_bind(argv[++i], 0, 0);
+        else if (same(a, "-B")) add_bind(argv[++i], 1, 0);
+        else if (same(a, "-W")) add_bind(argv[++i], 1, 1);
         else if (same(a, "-w")) workdir = argv[++i];
         else if (same(a, "-d")) {
             const char* p = argv[++i];
@@ -208,7 +227,7 @@ static void launch(long argc, char** argv, char** envp) {
         }
         else die("unknown option ", a);
     }
-    if (root == 0 || i >= argc) die("usage: burrow -r ROOTFS [-b HOST[:GUEST]]... [-B HOST[:GUEST]]... [-w DIR] [-d DNS_PORT] [-s STATS_FILE] [-g PATHGEN_FILE] PROGRAM [ARG]...", 0);
+    if (root == 0 || i >= argc) die("usage: burrow -r ROOTFS [-b HOST[:GUEST]]... [-B HOST[:GUEST]]... [-W HOST[:GUEST]]... [-w DIR] [-d DNS_PORT] [-s STATS_FILE] [-g PATHGEN_FILE] PROGRAM [ARG]...", 0);
 
     long fd = sys(NR_openat, AT_FDCWD, root, O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
     if (fd < 0 || (cfg.root_length = fd_path(fd, cfg.root, sizeof(cfg.root))) <= 1) die("cannot open the rootfs ", root);

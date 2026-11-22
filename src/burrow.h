@@ -66,7 +66,7 @@ enum {
 enum {
     EPERM = 1, ENODATA = 61, EOPNOTSUPP = 95, ENOENT = 2, ESRCH = 3, EINTR = 4, EIO = 5, E2BIG = 7, ENOEXEC = 8, EBADF = 9, ENOMEM = 12, EACCES = 13,
     EFAULT = 14, EXDEV = 18, ENOTDIR = 20, EISDIR = 21, EINVAL = 22, EMFILE = 24, ERANGE = 34, ENAMETOOLONG = 36, ENOSYS = 38,
-    ELOOP = 40, EROFS = 30,
+    ELOOP = 40, EROFS = 30, EBUSY = 16,
 };
 
 #define AT_FDCWD (-100)
@@ -180,15 +180,17 @@ struct kucontext {
 
 /* -- State ---------------------------------------------------------------------- */
 
-/* A binding from -b leaves what is below it to the kernel: symlinks there are
- * host paths (/proc's magic links). One from a guest's mount() of a directory
- * of the rootfs is walked like the rootfs: its symlinks are guest paths. */
+/* A binding from -b or -B leaves what is below it to the kernel: symlinks there
+ * are host paths (/proc's magic links). One from -W (read-only, Kestrel's tools
+ * and catalog), or from a guest's mount() of a directory of the rootfs, is
+ * walked like the rootfs: its symlinks are guest paths. */
 struct bind {
     char guest[256];
     char host[512];
     long guest_length, host_length;
     int walked;
-    int readonly; /* -B: writes, creates, renames and unlinks below it fail with EROFS */
+    int readonly; /* -B and -W: writes, creates, renames and unlinks below it fail with EROFS */
+    int launch;   /* given on the command line: the guest's umount() leaves it */
 };
 
 enum { RUID, EUID, SUID, FSUID, RGID, EGID, SGID, FSGID, ID_COUNT };
@@ -201,6 +203,10 @@ struct config {
     char self[512]; /* Burrow's binary */
     struct bind binds[MAX_BINDS];
     int bind_count;
+    /* The host folders of the command line's -B and -W bindings. Unlike binds[], no guest call shortens
+     * it (umount, a mount of the same name, chroot): a descriptor opened into one stays read-only. */
+    char ro_hosts[2 * MAX_BINDS][512]; /* with the data directory's other name of each */
+    int ro_count;
     uint32_t real_uid, real_gid;
     uint32_t ids[ID_COUNT]; /* the guest's, emulated; atomic */
     uint32_t groups[MAX_GROUPS]; /* its supplementary groups, emulated */
@@ -296,6 +302,7 @@ long take_shared_root(long pid, char* root, long size);
 /* Whether the guest sees the host path @host (in the root or a binding). */
 int guest_sees(const char* host);
 /* Whether the host path @host lies in a read-only binding (-B). */
+long other_name(const char* p, long n, char* out, long size);
 int read_only_host(const char* host);
 int read_only_fd(long fd);
 /* -EROFS when @host lies in a read-only binding, else 0. */

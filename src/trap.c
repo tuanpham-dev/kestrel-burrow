@@ -1530,7 +1530,7 @@ static void take_child_root(void) {
     if (n > 0) {
         memcpy(cfg.root, root, n + 1);
         cfg.root_length = n;
-        cfg.bind_count = 0;
+        cfg.bind_count = 0; /* cfg.ro_hosts stays: a descriptor opened into a read-only binding still is */
         set_root_alias();
         pathcache_reset_local();
         cfg.fs_child = 0;
@@ -1577,6 +1577,7 @@ static long add_binding(const char* guest, long g, const char* host, long h, int
     b->guest_length = g;
     b->host_length = h;
     b->walked = walked;
+    b->launch = 0;
     b->readonly = read_only_host(host); /* a bind mount of a read-only binding's files is read-only too */
     if (i == cfg.bind_count) cfg.bind_count++;
     return 0;
@@ -1629,6 +1630,7 @@ static long do_umount(const char* target) {
     if (g < 0) return g;
     for (int i = 0; i < cfg.bind_count; i++) {
         if (!same(cfg.binds[i].guest, guest)) continue;
+        if (cfg.binds[i].launch && cfg.binds[i].readonly) return -EBUSY; /* a read-only binding of the launch stays */
         memmove(&cfg.binds[i], &cfg.binds[i + 1], (cfg.bind_count - i - 1) * sizeof(*cfg.binds));
         cfg.bind_count--;
         break;
@@ -1713,6 +1715,7 @@ static long do_chroot(const char* path) {
         k->host_length = b->host_length;
         k->walked = b->walked;
         k->readonly = b->readonly;
+        k->launch = b->launch;
         k->guest_length = b->guest_length - g;
         memmove(k->guest, b->guest + g, k->guest_length + 1);
     }
