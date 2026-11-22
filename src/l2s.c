@@ -137,14 +137,20 @@ long l2s_unlinked(const char* host) {
     if (!resolve_link(host, intermediate, final)) return 0;
     long count = count_of(final) - 1;
     long r;
+    /* The chain's links change under the same names: the path cache's copy of their text goes. */
+    pathcache_invalidate();
     if (count > 0) {
         with_count(final, count, next);
         if ((r = sys(NR_renameat, AT_FDCWD, final, AT_FDCWD, next)) < 0) return r;
         sys(NR_unlinkat, AT_FDCWD, intermediate, 0, 0);
-        return sys(NR_symlinkat, next, AT_FDCWD, intermediate, 0);
+        r = sys(NR_symlinkat, next, AT_FDCWD, intermediate, 0);
+        pathcache_invalidate();
+        return r;
     }
     sys(NR_unlinkat, AT_FDCWD, intermediate, 0, 0);
-    return sys(NR_unlinkat, AT_FDCWD, final, 0, 0);
+    r = sys(NR_unlinkat, AT_FDCWD, final, 0, 0);
+    pathcache_invalidate();
+    return r;
 }
 
 /* Moves @old to the file of a new chain named after @name in the directory
@@ -177,9 +183,12 @@ long l2s_link(const char* old, const char* new) {
     if (((st.mode & S_IFMT) == S_IFLNK && resolve_link(old, intermediate, final)) ||
         resolve_member(old, intermediate, final)) {
         with_count(final, count_of(final) + 1, next);
+        pathcache_invalidate(); /* the intermediate link gets new text under its name */
         if ((r = sys(NR_renameat, AT_FDCWD, final, AT_FDCWD, next)) < 0) return r;
         sys(NR_unlinkat, AT_FDCWD, intermediate, 0, 0);
-        if ((r = sys(NR_symlinkat, next, AT_FDCWD, intermediate, 0)) < 0) return r;
+        r = sys(NR_symlinkat, next, AT_FDCWD, intermediate, 0);
+        pathcache_invalidate();
+        if (r < 0) return r;
     } else {
         char store[PATH_MAX], ino[24];
         long n = cfg.root_length + (long) sizeof("/" STORE "/") - 1;

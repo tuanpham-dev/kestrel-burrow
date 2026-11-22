@@ -97,5 +97,183 @@ except (OSError, IndexError):
     name = None
 ok(name is None or os.uname().nodename == name, "uname()'s nodename is /etc/hostname's")
 
+# A guest root drops to another user the way util-linux's setpriv does (man-db's trigger): keep the
+# capabilities across setresuid(), raise the effective set again with capset(), then set the groups and the
+# group ids. The same steps as a user, or without PR_SET_KEEPCAPS, fail.
+def capget(libc):
+    hdr = (ctypes.c_uint32 * 2)(0x20080522, 0)
+    data = (ctypes.c_uint32 * 6)()
+    libc.syscall(90, hdr, data)
+    return data
+
+
+def capset_effective_from_permitted(libc):
+    data = capget(libc)
+    data[0], data[3] = data[1], data[4]
+    hdr = (ctypes.c_uint32 * 2)(0x20080522, 0)
+    return libc.syscall(91, hdr, data)
+
+
+def drop_like_setpriv(keep):
+    libc.prctl(8, 1 if keep else 0, 0, 0, 0)  # (set above: an earlier check leaves it on)
+    os.setresuid(6, 6, 6)
+    if keep:
+        ok_caps = capset_effective_from_permitted(libc)
+        if ok_caps != 0:
+            return "capset"
+    try:
+        os.setresgid(12, 12, 12)
+        os.setgroups([12])
+    except OSError as e:
+        return "EPERM" if e.errno == errno.EPERM else "errno %d" % e.errno
+    return "ok" if os.getresgid() == (12, 12, 12) and os.getresuid() == (6, 6, 6) else "ids"
+
+
+def in_child(f):
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            os.write(w, f().encode())
+        finally:
+            os._exit(0)
+    os.close(w)
+    out = os.read(r, 100).decode()
+    os.waitpid(pid, 0)
+    return out
+
+
+ok(in_child(lambda: drop_like_setpriv(True)) == "ok", "root drops uid then gid with KEEPCAPS and capset (setpriv)")
+ok(in_child(lambda: drop_like_setpriv(False)) == "EPERM", "without KEEPCAPS the group ids can no longer be set")
+
+
+def user_cannot():
+    libc.prctl(8, 0, 0, 0, 0)
+    os.setgroups([1000])
+    os.setresgid(1000, 1000, 1000)
+    os.setresuid(1000, 1000, 1000)
+    libc.prctl(8, 1, 0, 0, 0)  # too late: the capabilities went with the uid change
+    capset_effective_from_permitted(libc)  # accepted, but a user has nothing to raise
+    try:
+        os.setresgid(12, 12, 12)
+    except OSError as e:
+        return "EPERM" if e.errno == errno.EPERM else "errno %d" % e.errno
+    return "no error"
+
+
+ok(in_child(user_cannot) == "EPERM", "a user cannot set another group id, whatever capset() was asked")
+
+
+def effective_back():  # root's euid dropped and restored keeps what root has
+    os.seteuid(1000)
+    os.seteuid(0)
+    os.setgroups([5])
+    return "ok"
+
+
+ok(in_child(effective_back) == "ok", "root's seteuid(user) then seteuid(0) keeps the ability to set groups")
+
+# capset() lowers (Linux's rules): the permitted pair is kept only when the new permitted set has both bits, the
+# effective pair only when the new effective set has them as well
+def capset_words(libc, eff, perm):
+    data = (ctypes.c_uint32 * 6)()
+    data[0], data[1], data[3], data[4] = eff, perm, eff, perm
+    hdr = (ctypes.c_uint32 * 2)(0x20080522, 0)
+    return libc.syscall(91, hdr, data)
+
+
+def groups_result():
+    try:
+        os.setgroups([5])
+    except OSError as e:
+        return "EPERM" if e.errno == errno.EPERM else "errno %d" % e.errno
+    return "ok"
+
+
+def capset_keep():
+    capset_words(libc, 0xffffffff, 0xffffffff)
+    return groups_result()
+
+
+def capset_drop_effective():  # the permitted pair stays, the effective pair goes, and comes back from permitted
+    r = capset_words(libc, 0, 0xffffffff)
+    before = groups_result()
+    capset_effective_from_permitted(libc)
+    return "%d %s %s" % (r, before, groups_result())
+
+
+def capset_empty():
+    r = capset_words(libc, 0, 0)
+    after = groups_result()
+    capset_effective_from_permitted(libc)  # nothing is permitted any more: still nothing to raise
+    return "%d %s %s" % (r, after, groups_result())
+
+
+def capset_empty_then_full():
+    capset_words(libc, 0, 0)
+    capset_words(libc, 0xffffffff, 0xffffffff)
+    return groups_result()
+
+
+def capset_empty_then_root():
+    libc.prctl(8, 1, 0, 0, 0)
+    os.setresuid(6, 6, 6)
+    capset_effective_from_permitted(libc)
+    capset_words(libc, 0, 0)
+    try:
+        os.setresuid(0, 0, 0)
+    except OSError as e:
+        return "EPERM" if e.errno == errno.EPERM else "errno %d" % e.errno
+    return "no error"
+
+
+def raised_then_root():  # the control: without the empty capset the same steps get root back
+    libc.prctl(8, 1, 0, 0, 0)
+    os.setresuid(6, 6, 6)
+    capset_effective_from_permitted(libc)
+    os.setresuid(0, 0, 0)
+    return "ok"
+
+
+ok(in_child(capset_keep) == "ok", "capset with both capabilities keeps them")
+ok(in_child(capset_drop_effective) == "0 EPERM ok", "capset without them in the effective set drops that set only")
+ok(in_child(capset_empty) == "0 EPERM EPERM", "capset with an empty permitted set drops both, and returns 0")
+ok(in_child(capset_empty_then_full) == "EPERM", "capset cannot raise what an earlier capset dropped")
+ok(in_child(capset_empty_then_root) == "EPERM", "after an empty capset setresuid(0, 0, 0) is EPERM")
+ok(in_child(raised_then_root) == "ok", "without it setresuid(0, 0, 0) works after raising the effective set")
+
+
+def exec_after_seteuid():  # exec with ruid 0 and euid 1000 keeps the permitted set
+    import subprocess
+    os.seteuid(1000)
+    code = "import os; os.seteuid(0); os.setgroups([5]); print('ok')"
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    return p.stdout.strip() or "failed"
+
+
+def exec_as_user():  # a program started with every id 1000 has nothing
+    import subprocess
+    os.setgroups([1000])
+    os.setresgid(1000, 1000, 1000)
+    os.setresuid(1000, 1000, 1000)
+    code = "import os\ntry:\n os.setgroups([5]); print('ok')\nexcept OSError as e: print('EPERM' if e.errno == 1 else e.errno)"
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    return p.stdout.strip() or "failed"
+
+
+ok(in_child(exec_after_seteuid) == "ok", "exec with seteuid(1000) done: seteuid(0) and setgroups still work")
+ok(in_child(exec_as_user) == "EPERM", "exec with every id 1000: no capabilities")
+
+import pwd
+if shutil.which("setpriv") and shutil.which("id") and "man" in [u.pw_name for u in pwd.getpwall()]:
+    import subprocess
+    p = subprocess.run(["setpriv", "--reuid", "man", "--regid", "man", "--init-groups", "id", "-u"],
+                       capture_output=True, text=True)
+    ok(p.returncode == 0 and p.stdout.strip() == "6", "as root: setpriv --reuid man --regid man --init-groups id")
+    p = subprocess.run(["setpriv", "--reuid", "man", "--regid", "man", "--init-groups", "setpriv",
+                        "--reuid", "daemon", "--regid", "daemon", "id", "-u"], capture_output=True, text=True)
+    ok(p.returncode != 0, "as the man user the same call fails")
+
 shutil.rmtree(d)
 sys.exit(1 if fails else 0)

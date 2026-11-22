@@ -133,11 +133,11 @@ long install_filter(void) {
     f[i++] = (struct sock_filter){JSET, TO_TRAP, 0, 0x200 /* CLONE_FS */};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
     /* prctl(PR_SET_KEEPCAPS) succeeds: Android locks the bit (ping keeps
-     * capabilities across setuid()), and the guest's capabilities are fake. */
-    f[i++] = (struct sock_filter){JEQ, 0, 5, NR_prctl};
+     * capabilities across setuid()), and the guest's capabilities are fake. It traps so that the
+     * handler can note it: a change of uid then keeps the capabilities setpriv needs. */
+    f[i++] = (struct sock_filter){JEQ, 0, 4, NR_prctl};
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 16}; /* args[0], low half */
-    f[i++] = (struct sock_filter){JEQ, 0, 1, PR_SET_KEEPCAPS};
-    f[i++] = (struct sock_filter){RET, 0, 0, RET_ERRNO | 0};
+    f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, PR_SET_KEEPCAPS};
     f[i++] = (struct sock_filter){JEQ, TO_TRAP, 0, PR_SET_SECCOMP}; /* the guest's own filter, see do_guest_filter() */
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
     f[i++] = (struct sock_filter){JEQ, 0, 3, NR_seccomp};
@@ -289,10 +289,28 @@ static void fake_owner(uint32_t* uid, uint32_t* gid, uint32_t mode) {
 
 static int one_of(uint32_t v, int base) { return v == id(base) || v == id(base + 1) || v == id(base + 2); }
 
+/* The capabilities of Linux's rules for a change of uid (capabilities(7), "effect of user ID changes"): only
+ * CAP_SETUID and CAP_SETGID are followed, as one pair. A guest root that drops its uids loses them unless
+ * prctl(PR_SET_KEEPCAPS) was set, and its effective set is cleared when the effective uid leaves 0 (setpriv
+ * raises it again with capset() before it sets the group ids). A program that never made a capability call
+ * sees no change: root can always switch users, a non-root user never can. */
+static void cap_uid_change(uint32_t old_r, uint32_t old_e, uint32_t old_s) {
+    uint32_t r = id(RUID), e = id(EUID), s = id(SUID);
+    int was_root = old_r == 0 || old_e == 0 || old_s == 0;
+    int is_root = r == 0 || e == 0 || s == 0;
+    if (was_root && !is_root && !__atomic_load_n(&cfg.keepcaps, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&cfg.cap_perm, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&cfg.cap_eff, 0, __ATOMIC_RELAXED);
+    }
+    if (old_e == 0 && e != 0) __atomic_store_n(&cfg.cap_eff, 0, __ATOMIC_RELAXED);
+    if (old_e != 0 && e == 0) __atomic_store_n(&cfg.cap_eff, __atomic_load_n(&cfg.cap_perm, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+}
+
 /* setuid() and friends, @base RUID or RGID. -1 leaves an id as it is. */
 static long set_ids(int base, uint32_t r, uint32_t e, uint32_t s, int kind) {
-    int privileged = id(EUID) == 0;
+    int privileged = __atomic_load_n(&cfg.cap_eff, __ATOMIC_RELAXED);
     uint32_t none = (uint32_t) -1;
+    uint32_t old_r3 = id(base), old_e3 = id(base + 1), old_s3 = id(base + 2);
     if (kind == 1) { /* setuid */
         if (privileged) {
             set_id(base, r), set_id(base + 1, r), set_id(base + 2, r), set_id(base + 3, r);
@@ -301,6 +319,7 @@ static long set_ids(int base, uint32_t r, uint32_t e, uint32_t s, int kind) {
         } else {
             return -EPERM;
         }
+        if (base == RUID) cap_uid_change(old_r3, old_e3, old_s3);
         return 0;
     }
     if (!privileged) {
@@ -317,6 +336,7 @@ static long set_ids(int base, uint32_t r, uint32_t e, uint32_t s, int kind) {
         set_id(base + 2, s);
     }
     set_id(base + 3, id(base + 1));
+    if (base == RUID) cap_uid_change(old_r3, old_e3, old_s3);
     return 0;
 }
 
@@ -329,7 +349,7 @@ static long get_ids(int base, uint32_t* r, uint32_t* e, uint32_t* s) {
 
 static long set_fs_id(int base, uint32_t v) {
     uint32_t old = id(base + 3);
-    if (id(EUID) == 0 || one_of(v, base) || v == old) set_id(base + 3, v);
+    if (__atomic_load_n(&cfg.cap_eff, __ATOMIC_RELAXED) || one_of(v, base) || v == old) set_id(base + 3, v);
     return old;
 }
 
@@ -583,6 +603,12 @@ static int empty(const char* path) { return path != 0 && path[0] == 0; }
 
 /* statfs(), fstatfs(): a binding of a directory onto /sys is sysfs to the guest
  * (systemd's sd-device refuses other file systems), /sys/fs/cgroup cgroup2. */
+/* Whether the host path @host is a symlink (not followed): the path cache holds their text. */
+static int is_symlink(const char* host) {
+    struct kstat st;
+    return sys(NR_newfstatat, AT_FDCWD, (long) host, (long) &st, AT_SYMLINK_NOFOLLOW) == 0 && (st.mode & S_IFMT) == S_IFLNK;
+}
+
 static long do_statfs(long nr, const uint64_t* x) {
     char host[PATH_MAX], guest[PATH_MAX];
     long r;
@@ -1825,7 +1851,13 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_unshare: return do_unshare((long) x[0]);
     case NR_ptrace: return do_traceme();
     case NR_seccomp:
-    case NR_prctl: return do_guest_filter(nr, x);
+    case NR_prctl:
+        if (x[0] == PR_SET_KEEPCAPS) { /* succeeds (the seccomp filter used to answer it), and is noted */
+            if (x[1] > 1) return -EINVAL;
+            __atomic_store_n(&cfg.keepcaps, (int) x[1], __ATOMIC_RELAXED);
+            return 0;
+        }
+        return do_guest_filter(nr, x);
     case NR_mprotect: return do_mprotect(x);
     case NR_mmap: return sys6(NR_mmap, x[0], x[1], __atomic_load_n(&cfg.no_bti, __ATOMIC_RELAXED) ? x[2] & ~(uint64_t) PROT_BTI : x[2], x[3], x[4], x[5]);
     case NR_mkdirat: {
@@ -1848,9 +1880,12 @@ static long emulate(long nr, const uint64_t* x) {
         long r = host_path(dirfd, path, 0, host);
         if (r < 0 || (r = ro_guard(host)) < 0) return r;
         if (!(x[2] & 0x200 /* AT_REMOVEDIR */) && (r = l2s_unlinked(host)) < 0) return r;
-        if (x[2] & 0x200) pathcache_invalidate(); /* a directory goes away: before and after */
+        /* a directory or a symlink (the path cache remembers both) goes away: bump before and after */
+        int bump = (x[2] & 0x200) != 0;
+        if (!bump) bump = is_symlink(host);
+        if (bump) pathcache_invalidate();
         r = sys(NR_unlinkat, AT_FDCWD, host, x[2], 0);
-        if (x[2] & 0x200) pathcache_invalidate();
+        if (bump) pathcache_invalidate();
         if (r != -EACCES || id(FSUID) != 0) return r;
         /* Root removes from read-only directories too (rm -rf of Go's module cache). */
         long slash = length_of(host);
@@ -1919,6 +1954,7 @@ static long emulate(long nr, const uint64_t* x) {
             struct kstat st;
             bump = sys(NR_newfstatat, AT_FDCWD, (long) from, (long) &st, AT_SYMLINK_NOFOLLOW) < 0 || (st.mode & S_IFMT) != S_IFREG;
         }
+        if (!bump) bump = is_symlink(to); /* a symlink replaced by a file */
         if (bump) pathcache_invalidate();
         long rflags = nr == NR_renameat ? 0 : (long) x[4];
         r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, rflags, 0);
@@ -2023,8 +2059,9 @@ static long emulate(long nr, const uint64_t* x) {
         if (pid != 0 && pid != sys(NR_getpid, 0, 0, 0, 0) && sys(NR_kill, pid, 0, 0, 0) == -ESRCH) return -ESRCH;
         if (data) {
             /* another process's: its ids are not known here, so the caller's rule is shown */
-            uint32_t all = id(EUID) == 0 ? 0xffffffffu : 0;
-            for (int i = 0; i < words; i++) data[i * 3] = all, data[i * 3 + 1] = all, data[i * 3 + 2] = 0;
+            uint32_t perm = __atomic_load_n(&cfg.cap_perm, __ATOMIC_RELAXED) ? 0xffffffffu : 0;
+            uint32_t eff = __atomic_load_n(&cfg.cap_eff, __ATOMIC_RELAXED) ? 0xffffffffu : 0;
+            for (int i = 0; i < words; i++) data[i * 3] = eff, data[i * 3 + 1] = perm, data[i * 3 + 2] = 0;
             if (words == 2) data[3] &= 0x1ff, data[4] &= 0x1ff; /* capabilities 32..40 */
         }
         return 0;
@@ -2034,9 +2071,22 @@ static long emulate(long nr, const uint64_t* x) {
         if (header == 0) return -EFAULT;
         if (header[0] != 0x20080522 && header[0] != 0x20071026 && header[0] != 0x19980330) return -EINVAL;
         if (header[1] != 0 && (int32_t) header[1] != (int32_t) sys(NR_getpid, 0, 0, 0, 0)) return -EPERM;
-        /* No state is kept: a later capget() shows the full set again, and any set is accepted
-         * (a daemon that switches users keeping some capabilities, as dbus-daemon does, calls
-         * this as non-root). Guest users are not a security boundary (plan, Constraints). */
+        /* Only CAP_SETUID and CAP_SETGID are tracked, and they follow Linux's rules: the call raises
+         * nothing that is not permitted, it lowers. A process that kept its permitted capabilities across a
+         * change of uid (PR_SET_KEEPCAPS) can raise the effective pair again, as setpriv does before it sets the
+         * group ids. The permitted pair is lost when the new permitted set lacks either bit, the effective pair
+         * when the new effective set lacks either (or the permitted pair is gone). Any set is accepted (a daemon
+         * that switches users keeping some capabilities, as dbus-daemon does, calls this as non-root) and a later
+         * capget() shows the full set while the pair is held. Guest users are not a security boundary (plan,
+         * Constraints). */
+        const uint32_t* data = (const uint32_t*) x[1];
+        if (data != 0) {
+            const uint32_t both = (1u << 6) | (1u << 7); /* CAP_SETGID, CAP_SETUID */
+            int perm = __atomic_load_n(&cfg.cap_perm, __ATOMIC_RELAXED) && (data[1] & both) == both;
+            int eff = perm && (data[0] & both) == both;
+            __atomic_store_n(&cfg.cap_perm, perm, __ATOMIC_RELAXED);
+            __atomic_store_n(&cfg.cap_eff, eff, __ATOMIC_RELAXED);
+        }
         return 0;
     }
     case NR_getuid: return id(RUID);
@@ -2063,7 +2113,7 @@ static long emulate(long nr, const uint64_t* x) {
     }
     case NR_setgroups: {
         long size = (long) x[0];
-        if (id(EUID) != 0) return -EPERM;
+        if (!__atomic_load_n(&cfg.cap_eff, __ATOMIC_RELAXED)) return -EPERM;
         /* shortcut: more groups than MAX_GROUPS fail; raise it if a program needs them. */
         if (size < 0 || size > MAX_GROUPS) return -EINVAL;
         if (size > 0 && x[1] == 0) return -EFAULT;

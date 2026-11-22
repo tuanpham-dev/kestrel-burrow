@@ -106,6 +106,12 @@ int decode_config(const char* s) {
         if (!take_number(&s, &v)) return 0;
         cfg.ids[i] = (uint32_t) v;
     }
+    /* a new program, as Linux's rules for exec give it: the permitted set is all of root's when the real or the
+     * effective uid is 0, the effective set only when the effective uid is 0 (a root that dropped its effective
+     * uid keeps the permitted set); keepcaps is cleared */
+    cfg.cap_perm = cfg.ids[RUID] == 0 || cfg.ids[EUID] == 0;
+    cfg.cap_eff = cfg.ids[EUID] == 0;
+    cfg.keepcaps = 0;
     if (!take(&s, cfg.exe, sizeof(cfg.exe)) || !take(&s, cfg.host_exe, sizeof(cfg.host_exe)) ||
         !take(&s, cfg.name, sizeof(cfg.name)))
         return 0;

@@ -210,6 +210,12 @@ struct config {
     uint32_t real_uid, real_gid;
     uint32_t ids[ID_COUNT]; /* the guest's, emulated; atomic */
     uint32_t groups[MAX_GROUPS]; /* its supplementary groups, emulated */
+    /* Kestrel: the capabilities that decide setuid() and setgroups(), as Linux's rules for a change of
+     * uid keep them. Not passed to a new program: it starts with all of them when its effective uid is 0, with
+     * none otherwise (decode_config). All atomic. */
+    int cap_perm;  /* CAP_SETUID and CAP_SETGID are permitted */
+    int cap_eff;   /* and effective: what setresuid(), setresgid() and setgroups() ask for */
+    int keepcaps;  /* prctl(PR_SET_KEEPCAPS): a change of all uids to non-zero keeps the permitted set */
     int group_count;
     char exe[PATH_MAX];      /* the guest program, as a guest path */
     char host_exe[PATH_MAX]; /* and as a host path */

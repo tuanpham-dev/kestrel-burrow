@@ -242,6 +242,7 @@ static void launch(long argc, char** argv, char** envp) {
     cfg.real_gid = (uint32_t) sys(NR_getgid, 0, 0, 0, 0);
     /* ids[] start at 0: the guest is root, in group root only. */
     cfg.group_count = 1;
+    cfg.cap_perm = cfg.cap_eff = 1;
 
     /* Before any path: Android may trap a syscall of ours (openat2), and the
      * handler turns that into ENOSYS instead of a death by SIGSYS. */

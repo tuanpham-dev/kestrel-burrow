@@ -373,6 +373,15 @@ static int has_parent(const char* rest) {
 #define DIRCACHE_SLOTS 4096
 struct dirslot { uint64_t key, meta, check; }; /* meta: generation << 16 | length */
 static struct dirslot dircache[DIRCACHE_SLOTS];
+#define LINKCACHE_SLOTS 1024
+#define LINKCACHE_TEXT 112
+struct linkslot {
+    uint64_t seq; /* odd: being written */
+    uint64_t key, meta; /* meta: generation << 16 | path length */
+    uint16_t length; /* of the text */
+    char text[LINKCACHE_TEXT];
+};
+static struct linkslot linkcache[LINKCACHE_SLOTS];
 static uint64_t* volatile pathgen; /* shared counter; 0 until mapped, (uint64_t*) 1 if unavailable */
 
 /* The counter lives in a file given with -g (the app's private state directory, outside the
@@ -411,7 +420,10 @@ void pathcache_invalidate(void) {
     if (g) __atomic_add_fetch(g, 1, __ATOMIC_RELEASE);
 }
 
-void pathcache_reset_local(void) { memset(dircache, 0, sizeof(dircache)); }
+void pathcache_reset_local(void) {
+    memset(dircache, 0, sizeof(dircache));
+    memset(linkcache, 0, sizeof(linkcache));
+}
 
 static uint64_t gen_now(void) {
     uint64_t* g = gen_counter();
@@ -444,6 +456,52 @@ static void dircache_put(const char* p, long n, uint64_t gen) {
     __atomic_store_n(&s->key, key, __ATOMIC_RELAXED);
     __atomic_store_n(&s->meta, meta, __ATOMIC_RELAXED);
     __atomic_store_n(&s->check, key ^ meta ^ 0x9e3779b97f4a7c15ull, __ATOMIC_RELEASE);
+}
+
+/* -- Symlink cache (Kestrel) --------------------------------------------------------------
+ * The walk reads every symlink on a path again (lstat() and readlink()) however many times a
+ * program meets it; a theme whose "actions/actions" links to "." gives paths with up to forty
+ * such links and the walk made two host calls and a restart for each. A process remembers the
+ * text of the symlinks it has read (guest path of the link and its content as the walk uses
+ * it, "unhost"ed, of a link outside every binding that is no faked hard link), under the rules
+ * of the directory cache: an entry is valid while the shared counter equals the one read before
+ * the lstat() that saw the link. Anything that can make a name a different link or no link
+ * bumps the counter: unlink of a symlink, rename of or over one, symlink(), the bumps of the
+ * directory cache (rename of a directory, rmdir, mount, umount, chroot). A slot is guarded by
+ * a sequence word (odd while written), so a reader never sees half of a text. */
+
+/* The text of the symlink at the guest path @p (@n bytes) into @text, its length, or -1. */
+static long linkcache_get(const char* p, long n, char* text) {
+    uint64_t* g = gen_counter();
+    if (!g) return -1;
+    uint64_t key = fnv(p, n) ^ 0x5bd1e9955bd1e995ull, gen = __atomic_load_n(g, __ATOMIC_ACQUIRE);
+    struct linkslot* s = &linkcache[key % LINKCACHE_SLOTS];
+    uint64_t q = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
+    if ((q & 1) || __atomic_load_n(&s->key, __ATOMIC_RELAXED) != key ||
+        __atomic_load_n(&s->meta, __ATOMIC_RELAXED) != (gen << 16 | (uint64_t) (n & 0xffff)))
+        return -1;
+    long len = __atomic_load_n(&s->length, __ATOMIC_RELAXED);
+    if (len <= 0 || len >= LINKCACHE_TEXT) return -1;
+    memcpy(text, s->text, (size_t) len + 1);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&s->seq, __ATOMIC_RELAXED) != q) return -1;
+    text[len] = 0;
+    return len;
+}
+
+/* @gen: the counter read before the lstat() that saw the link (as for dircache_put()). */
+static void linkcache_put(const char* p, long n, uint64_t gen, const char* text, long len) {
+    if (!gen_counter() || len <= 0 || len >= LINKCACHE_TEXT) return;
+    uint64_t key = fnv(p, n) ^ 0x5bd1e9955bd1e995ull;
+    struct linkslot* s = &linkcache[key % LINKCACHE_SLOTS];
+    uint64_t q = __atomic_load_n(&s->seq, __ATOMIC_RELAXED);
+    if ((q & 1) || !__atomic_compare_exchange_n(&s->seq, &q, q + 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    __atomic_store_n(&s->key, key, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->meta, gen << 16 | (uint64_t) (n & 0xffff), __ATOMIC_RELAXED);
+    __atomic_store_n(&s->length, (uint16_t) len, __ATOMIC_RELAXED);
+    memcpy(s->text, text, (size_t) len);
+    s->text[len] = 0;
+    __atomic_store_n(&s->seq, q + 2, __ATOMIC_RELEASE);
 }
 
 /* The slow path: resolves @path one component at a time. */
@@ -496,19 +554,27 @@ static long walk(const char* path, int follow, char* host, char* out) {
         long r = host_of(out, n, host);
         if (r < 0) return r;
         uint64_t gen = gen_now();
-        r = sys(NR_newfstatat, AT_FDCWD, host, &st, AT_SYMLINK_NOFOLLOW);
-        if (r == -ENOENT && last) break; /* to be created */
-        if (r < 0) return r;
-        if ((st.mode & S_IFMT) == S_IFLNK) {
+        long t = b == 0 ? linkcache_get(out, n, target) : -1;
+        int cached = t > 0;
+        if (!cached) {
+            r = sys(NR_newfstatat, AT_FDCWD, host, &st, AT_SYMLINK_NOFOLLOW);
+            if (r == -ENOENT && last) break; /* to be created */
+            if (r < 0) return r;
+        }
+        if (cached || (st.mode & S_IFMT) == S_IFLNK) {
             if (++links > 40) return -ELOOP;
-            long t = sys(NR_readlinkat, AT_FDCWD, host, target, PATH_MAX - 1);
-            if (t < 0) return t;
-            target[t] = 0;
-            long u = unhost(target, t);
-            if (u == t && !under_read_only(host) && l2s_target(target)) {
-                /* A faked hard link made under another root (a walked binding
-                 * after chroot): its file is a host path, and no directory. */
-                return join(host, target, t, rest + at) < 0 || join(out, out, n, rest + at) < 0 ? -ENAMETOOLONG : 0;
+            long u = t;
+            if (!cached) {
+                t = sys(NR_readlinkat, AT_FDCWD, host, target, PATH_MAX - 1);
+                if (t < 0) return t;
+                target[t] = 0;
+                u = unhost(target, t);
+                if (u == t && !under_read_only(host) && l2s_target(target)) {
+                    /* A faked hard link made under another root (a walked binding
+                     * after chroot): its file is a host path, and no directory. */
+                    return join(host, target, t, rest + at) < 0 || join(out, out, n, rest + at) < 0 ? -ENAMETOOLONG : 0;
+                }
+                if (b == 0) linkcache_put(out, n, gen, target, u);
             }
             t = u;
             long tail = rest_length - at;
@@ -519,11 +585,13 @@ static long walk(const char* path, int follow, char* host, char* out) {
             at = 0;
             n = target[0] == '/' ? 1 : previous;
             out[n] = 0;
-            /* What is left most often has no symlink (/lib -> usr/lib): try it whole. */
+            /* What is left most often has no symlink (/lib -> usr/lib): try it whole, after the first link
+             * of the walk and after one that ends the path (a file link's target), not after each link of a
+             * chain of folder links, which the next link would defeat. */
             long w = rest[0] == '/' ? 0 : n;
-            memcpy(target, out, w);
-            if (w > 1) target[w++] = '/';
-            if (w + rest_length < PATH_MAX) {
+            if ((links == 1 || only_slashes(rest + t)) && w + rest_length < PATH_MAX) {
+                memcpy(target, out, w);
+                if (w > 1) target[w++] = '/';
                 memcpy(target + w, rest, rest_length + 1);
                 tidy(target);
                 long whole = probe(target, follow, host, out);
