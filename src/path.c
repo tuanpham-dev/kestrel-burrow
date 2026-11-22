@@ -425,6 +425,13 @@ void pathcache_reset_local(void) {
     memset(linkcache, 0, sizeof(linkcache));
 }
 
+/* In the child of a fork() (own copy of the memory): a slot the parent's other thread was writing at that moment
+ * stays odd for ever, and would never be cached again; no thread of this process writes it, so it is emptied. */
+void pathcache_fork_child(void) {
+    for (int i = 0; i < LINKCACHE_SLOTS; i++)
+        if (linkcache[i].seq & 1) memset(&linkcache[i], 0, sizeof(linkcache[i]));
+}
+
 static uint64_t gen_now(void) {
     uint64_t* g = gen_counter();
     return g ? __atomic_load_n(g, __ATOMIC_ACQUIRE) : 0;

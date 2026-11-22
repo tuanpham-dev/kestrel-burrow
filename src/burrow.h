@@ -321,6 +321,7 @@ long host_fd(long dirfd, const char* path, int follow, char* host, long* fd);
 void pathcache_invalidate(void);
 /* Path cache (Kestrel): forget this process's cached directories (its root changed). */
 void pathcache_reset_local(void);
+void pathcache_fork_child(void);
 /* openat() in one walk, when the kernel resolves the path as we would: a
  * plain path and no symlink. -ELOOP, -EINVAL (openat2() is stricter) and
  * -EACCES (the fake root's permissions) mean taking to_host()'s way. */

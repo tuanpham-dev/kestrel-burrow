@@ -1540,6 +1540,7 @@ static long do_clone(struct kucontext* uc) {
     if (r == 0) {
         fs_parent = 1;
         cfg.fs_child = 0;
+        if (!(x[0] & 0x100 /* CLONE_VM */)) pathcache_fork_child();
         if (x[1] != 0) uc->mcontext.sp = x[1];
     } else if (r > 0) {
         cfg.fs_child = (int) r;
@@ -1898,6 +1899,7 @@ static long emulate(long nr, const uint64_t* x) {
             return r;
         host[slash] = '/';
         r = sys(NR_unlinkat, AT_FDCWD, host, x[2], 0);
+        if (bump) pathcache_invalidate(); /* the retry removed it: bump after it too */
         host[slash] = 0;
         sys(NR_fchmodat, AT_FDCWD, host, st.mode & 07777, 0);
         return r;
