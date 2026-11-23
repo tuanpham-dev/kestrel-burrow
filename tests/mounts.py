@@ -166,5 +166,15 @@ ok(os.path.ismount("/proc") and not os.path.ismount("/usr"), "ismount")
 ok(os.path.realpath("/proc/..") == "/" and os.stat("/proc/..").st_ino == os.stat("/").st_ino, "/proc/.. is /")
 ok(os.stat("/proc/self/../../etc").st_ino == os.stat("/etc").st_ino, ".. out of a binding, deeper")
 
+# statx() answers STATX_MNT_ID where the kernel has none (before 5.8): libglnx's path walk (Flatpak 1.16) needs it.
+stx = ctypes.create_string_buffer(256)
+ids_seen = []
+for p in ("/etc", "/etc/..", "/"):
+    r = libc.statx(-100, p.encode(), 0x100, 0x1 | 0x100 | 0x1000 | 0x4000, stx)  # TYPE|INO|MNT_ID|MNT_ID_UNIQUE
+    mask = int.from_bytes(stx.raw[0:4], "little")
+    ids_seen.append((r, mask & 0x5000 != 0, int.from_bytes(stx.raw[0x90:0x98], "little")))
+ok(all(r == 0 and has for r, has, _ in ids_seen), "statx gives a mount id")
+ok(ids_seen[1][2] == ids_seen[2][2], "statx: /etc/.. has the mount id of /")
+
 shutil.rmtree(d)
 sys.exit(1 if fails else 0)

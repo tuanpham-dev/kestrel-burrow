@@ -880,7 +880,26 @@ static long statx_host(long dirfd, const char* path, int follow, long flags, lon
     return r;
 }
 
+static long do_statx_own(long dirfd, const char* path, long flags, long mask, struct kstatx* stx);
+
+/* A mount id where the kernel gives none (before Linux 5.8: Android 12's 4.14 and 4.19). Flatpak 1.16
+ * (libglnx's glnx_chase) asks every statx() of its path walk for STATX_MNT_ID or STATX_MNT_ID_UNIQUE
+ * and fails with "statx didn't return all required fields" (ENODATA) without one: no runtime or app
+ * installs. The id is the device's, so a directory reached again by ".." has the same one, which is
+ * what the walk compares; bindings of one filesystem share it (they are not mounts on the host). */
+static void statx_mount_id(long r, long mask, struct kstatx* stx) {
+    if (r != 0 || !(mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE)) || (stx->mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE))) return;
+    stx->mnt_id = 0x10000000ull + ((uint64_t) stx->dev_major << 20) + stx->dev_minor;
+    stx->mask |= STATX_MNT_ID;
+}
+
 static long do_statx(long dirfd, const char* path, long flags, long mask, struct kstatx* stx) {
+    long r = do_statx_own(dirfd, path, flags, mask, stx);
+    statx_mount_id(r, mask, stx);
+    return r;
+}
+
+static long do_statx_own(long dirfd, const char* path, long flags, long mask, struct kstatx* stx) {
     long r;
     if (empty(path) && (flags & AT_EMPTY_PATH)) {
         r = sys6(NR_statx, dirfd, (long) path, flags, mask, (long) stx, 0);

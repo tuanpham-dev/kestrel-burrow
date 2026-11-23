@@ -92,6 +92,8 @@ enum {
 #define STATX_MODE 0x2u
 #define STATX_UID 0x8u
 #define STATX_GID 0x10u
+#define STATX_MNT_ID 0x1000u
+#define STATX_MNT_ID_UNIQUE 0x4000u
 #define IN_DONT_FOLLOW 0x02000000
 #define X_OK 1
 #define AF_UNIX 1
@@ -142,6 +144,7 @@ struct kstatx {
     uint64_t ino, size, blocks, attributes_mask;
     int64_t times[8];
     uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
+    uint64_t mnt_id; /* Linux 5.8 and later (STATX_MNT_ID); the caller's buffer is struct statx, 256 bytes */
 };
 
 struct ksigaction {
