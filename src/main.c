@@ -210,6 +210,10 @@ static void launch(long argc, char** argv, char** envp) {
         else if (same(a, "-b")) add_bind(argv[++i], 0, 0);
         else if (same(a, "-B")) add_bind(argv[++i], 1, 0);
         else if (same(a, "-W")) add_bind(argv[++i], 1, 1);
+        /* -L: writable, its links guest paths (Kestrel's runtime dir: Flatpak puts links there such
+         * as xdg-run/wayland-0 -> ../../flatpak/wayland-0, which must climb out of the binding the
+         * sandbox makes of that folder, as the guest sees it) */
+        else if (same(a, "-L")) add_bind(argv[++i], 0, 1);
         else if (same(a, "-w")) workdir = argv[++i];
         else if (same(a, "-d")) {
             const char* p = argv[++i];
@@ -227,7 +231,7 @@ static void launch(long argc, char** argv, char** envp) {
         }
         else die("unknown option ", a);
     }
-    if (root == 0 || i >= argc) die("usage: burrow -r ROOTFS [-b HOST[:GUEST]]... [-B HOST[:GUEST]]... [-W HOST[:GUEST]]... [-w DIR] [-d DNS_PORT] [-s STATS_FILE] [-g PATHGEN_FILE] PROGRAM [ARG]...", 0);
+    if (root == 0 || i >= argc) die("usage: burrow -r ROOTFS [-b HOST[:GUEST]]... [-B HOST[:GUEST]]... [-W HOST[:GUEST]]... [-L HOST[:GUEST]]... [-w DIR] [-d DNS_PORT] [-s STATS_FILE] [-g PATHGEN_FILE] PROGRAM [ARG]...", 0);
 
     long fd = sys(NR_openat, AT_FDCWD, root, O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
     if (fd < 0 || (cfg.root_length = fd_path(fd, cfg.root, sizeof(cfg.root))) <= 1) die("cannot open the rootfs ", root);

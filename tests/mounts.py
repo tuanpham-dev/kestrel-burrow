@@ -176,5 +176,22 @@ for p in ("/etc", "/etc/..", "/"):
 ok(all(r == 0 and has for r, has, _ in ids_seen), "statx gives a mount id")
 ok(ids_seen[1][2] == ids_seen[2][2], "statx: /etc/.. has the mount id of /")
 
+# -L (kestrel-run gives the runtime directory so): writable, and its links are guest paths, so an
+# absolute one names the guest's file, not the host's (Android has no /usr)
+run = os.environ.get("XDG_RUNTIME_DIR", "/run/kestrel")
+if os.path.isdir(run) and any(l.split()[4] == run for l in open("/proc/self/mountinfo")):
+    link = os.path.join(run, ".burrow-test-%d" % os.getpid())
+    os.symlink("/usr/share", link)
+    try:
+        ok(os.path.isdir(link) and os.path.realpath(link) == "/usr/share", "-L: an absolute link is a guest path")
+        with open(link + "-file", "w") as f:
+            f.write("x")
+        ok(open(link + "-file").read() == "x", "-L: writable")
+        os.unlink(link + "-file")
+    finally:
+        os.unlink(link)
+else:
+    print("skip -L: %s is not a binding" % run)
+
 shutil.rmtree(d)
 sys.exit(1 if fails else 0)
