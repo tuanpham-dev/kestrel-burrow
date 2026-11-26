@@ -126,10 +126,25 @@ def run(argv, env=None):
     return p.stdout.strip().split("\n")[-1] if p.returncode == 0 else "exit %d" % p.returncode
 
 
+def has_bti():
+    """The CPU and kernel support branch protection (HWCAP2_BTI in AT_HWCAP2); without it the kernel refuses PROT_BTI."""
+    getauxval = ctypes.CDLL(None).getauxval
+    getauxval.restype = ctypes.c_ulong
+    getauxval.argtypes = [ctypes.c_ulong]
+    return bool(getauxval(26) & (1 << 17))
+
+
+def keeps(result, what):
+    if has_bti():
+        ok(result == "bti 0 1 1", "%s (%s)" % (what, result))
+    else:
+        print("skip %s: this CPU has no BTI (%s)" % (what, result))
+
+
 if arm:
     me = os.path.abspath(__file__)
     plain = run([sys.executable, me, "bti-child"])
-    ok(plain == "bti 0 1 1", "an ordinary program keeps PROT_BTI in mprotect and mmap (%s)" % plain)
+    keeps(plain, "an ordinary program keeps PROT_BTI in mprotect and mmap")
     env = dict(os.environ, BURROW_NO_BTI="1")
     forced = run([sys.executable, me, "bti-child"], env)
     ok(forced == "bti 0 0 0", "BURROW_NO_BTI=1 drops it (%s)" % forced)
@@ -145,7 +160,7 @@ if arm:
     named = run([d + "/bin2/wine64", me, "bti-child"])
     ok(named == "bti 0 0 0", "wine64 outside a wine/ directory has it dropped (%s)" % named)
     other = run([d + "/bin2/wine64", me, "wine-then-other"])
-    ok(other == "bti 0 1 1", "what Wine starts keeps PROT_BTI (%s)" % other)
+    keeps(other, "what Wine starts keeps PROT_BTI")
     for n in ("python3", "wine64"):
         os.unlink(d + "/opt/wine/bin/" + n)
     os.rmdir(d + "/opt/wine/bin"); os.rmdir(d + "/opt/wine"); os.rmdir(d + "/opt")
