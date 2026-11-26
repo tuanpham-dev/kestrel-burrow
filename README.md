@@ -1,3 +1,5 @@
+> This is Burrow modified for Kestrel (https://github.com/tuanpham-dev/kestrel). Changes since November 2026 are the commits after `305b759`. Unmodified source: https://github.com/RickyTr99/burrow.
+
 <p align="center">
   <img src=".github/banner.png" alt="Burrow" width="640">
 </p>
